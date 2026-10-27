@@ -1,0 +1,5 @@
+# CODEOWNERS
+# Aria Pramesi (@sorcerai) owns the agent substrate (this estate fork of agent-substrate/substrate) as agent-admin
+# (operator ruling 2026-10-27). @todie keeps code-owner authority.
+
+* @sorcerai @todie
