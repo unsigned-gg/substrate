@@ -1,0 +1,201 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Cygnus: the unsigned-gg Talos bare-metal cluster. Composed into every control
+# plane apply through `manifests.components` (see docs/cygnus-install.md), so
+# the same patches reach a workload whichever ate-setup step delivers it.
+#
+# Every patch names its targets with a selector. kustomize skips a selector
+# that matches nothing, which is what lets one component serve the full
+# bundle and the single-component redeploys alike.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# The agentgateway image comes from the estate's Harbor mirror, pinned to the
+# same digest upstream pins. The ko:// component images are resolved by
+# ate-setup from images.repo and images.tag, not here.
+images:
+  - name: cr.agentgateway.dev/agentgateway
+    newName: harbor.unsigned.gg/platform/agentgateway
+    digest: sha256:5e8384d1fcfdc443a3ad5155ea6a64dc7953bde162df7f5f8e131a5c19ae08a3
+
+patches:
+  # Harbor is a private registry: every workload pulls with the harbor-pull
+  # Secret that the paas lane keeps in ate-system.
+  - target:
+      kind: Deployment|DaemonSet|StatefulSet|Job
+      name: .*
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: overridden-by-target
+      spec:
+        template:
+          spec:
+            imagePullSecrets:
+            - name: harbor-pull
+
+  # Snapshots live in the in-cluster rustfs (S3 API), not GCS. The
+  # objectstore-plugin sidecar on ate-api-server and atelet holds the storage
+  # settings; the credentials come from the ate-objectstore-s3 Secret, which
+  # the runbook creates from 1Password and never from a literal in Git.
+  - target:
+      kind: Deployment
+      name: ate-api-server
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ate-api-server
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            initContainers:
+            - name: objectstore-plugin
+              env:
+              - name: ATE_STORAGE_BACKEND
+                value: s3
+              - name: AWS_REGION
+                value: us-east-1
+              - name: AWS_ENDPOINT_URL
+                value: http://rustfs.ate-system.svc:9000
+              - name: AWS_S3_USE_PATH_STYLE
+                value: "true"
+              - name: AWS_ACCESS_KEY_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: ate-objectstore-s3
+                    key: AWS_ACCESS_KEY_ID
+              - name: AWS_SECRET_ACCESS_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: ate-objectstore-s3
+                    key: AWS_SECRET_ACCESS_KEY
+  - target:
+      kind: DaemonSet
+      name: atelet
+    patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            initContainers:
+            - name: objectstore-plugin
+              env:
+              - name: ATE_STORAGE_BACKEND
+                value: s3
+              - name: AWS_REGION
+                value: us-east-1
+              - name: AWS_ENDPOINT_URL
+                value: http://rustfs.ate-system.svc:9000
+              - name: AWS_S3_USE_PATH_STYLE
+                value: "true"
+              - name: AWS_ACCESS_KEY_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: ate-objectstore-s3
+                    key: AWS_ACCESS_KEY_ID
+              - name: AWS_SECRET_ACCESS_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: ate-objectstore-s3
+                    key: AWS_SECRET_ACCESS_KEY
+
+  # Talos nodes have no kubelet credential provider plugin at GKE's paths, and
+  # Harbor pulls are covered by the pull Secret above.
+  - target:
+      kind: DaemonSet
+      name: atelet
+    patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            containers:
+            - name: atelet
+              # The full v0.6.0 argument list minus the two kubelet credential
+              # provider flags: a list of strings merges as a whole, so this is
+              # re-derived from atelet.yaml on every upstream sync.
+              args:
+              - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+              - --client-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
+              - --ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
+              - --drain-delay=0s
+              - --drain-timeout=5m
+              - --objectstore-plugin-socket=/run/objectstore-plugin/node.sock
+              volumeMounts:
+              - mountPath: /run/image-credential-provider/bin
+                $patch: delete
+              - mountPath: /run/image-credential-provider/config.yaml
+                $patch: delete
+            volumes:
+            - name: image-credential-provider-bin
+              $patch: delete
+            - name: image-credential-provider-config
+              $patch: delete
+
+  # Telemetry goes to the estate's Grafana Alloy gateway. ate-otel-config is
+  # set through the otlpEndpoint install setting; agentgateway reads its own
+  # variable.
+  - target:
+      kind: Deployment
+      name: atenet-router|atenet-egress
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: overridden-by-target
+      spec:
+        template:
+          spec:
+            containers:
+            - name: agentgateway
+              env:
+              - name: AGENTGATEWAY_OTLP_ADDRESS
+                value: alloy-gateway.monitoring.svc.cluster.local:4317
+
+  - target:
+      kind: ConfigMap
+      name: ate-otel-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ate-otel-config
+        namespace: ate-system
+      data:
+        OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy-gateway.monitoring.svc.cluster.local:4317
+
+  # Google Managed Prometheus is not installed on Cygnus; the PodMonitoring
+  # CRD does not exist there.
+  - target:
+      kind: PodMonitoring
+      name: .*
+    patch: |-
+      apiVersion: monitoring.googleapis.com/v1
+      kind: PodMonitoring
+      metadata:
+        name: overridden-by-target
+        namespace: ate-system
+      $patch: delete

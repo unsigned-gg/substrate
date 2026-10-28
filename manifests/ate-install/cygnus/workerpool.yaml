@@ -1,0 +1,40 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The Cygnus default pool: four gVisor workers on the class default
+# SandboxConfig (gvisor-default, as ate-setup installs it). The worker image is
+# the v0.6.0 build published to Harbor by `ate-setup publish worker-images`,
+# pinned by digest. Applied after `ate-setup deploy ate-system`; see
+# docs/cygnus-install.md.
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: default-workers
+  namespace: ate-system
+spec:
+  replicas: 4
+  workerImage: harbor.unsigned.gg/platform/ateworker-gvisor@sha256:3e97cd95e44462a38f00ef06d5943ae681d9193f920b0e6bcb19e73c80d2c140
+  sandboxClasses:
+  - name: gvisor
+  template:
+    # Limits size the worker pod and advertise its per-actor ceiling; requests
+    # keep the pool placeable next to the rest of the install. Memory is not
+    # compressible, so its request matches the limit.
+    resources:
+      limits:
+        cpu: "2"
+        memory: 2Gi
+      requests:
+        cpu: 500m
+        memory: 2Gi
