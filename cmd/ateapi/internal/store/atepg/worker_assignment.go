@@ -19,10 +19,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/jackc/pgx/v5"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -89,9 +89,6 @@ func (p *Persistence) BindActorToWorker(ctx context.Context, workerName string, 
 			worker.Status = &ateapipb.WorkerStatus{}
 		}
 
-		// Read under the row lock, so an epoch raised concurrently is either
-		// seen here or raised after this bind commits.
-		assignment.WorkerEpoch = worker.GetEpoch()
 		assignmentBytes, err := proto.Marshal(assignment)
 		if err != nil {
 			return nil, fmt.Errorf("marshaling assignment: %w", err)
@@ -116,11 +113,7 @@ func (p *Persistence) BindActorToWorker(ctx context.Context, workerName string, 
 					return nil, err
 				}
 			}
-			allocated, err := resources.AddToAllocated(worker.Status.Allocated, assignment, +1)
-			if err != nil {
-				return nil, err
-			}
-			worker.Status.Allocated = allocated
+			worker.Status.Allocated = resources.AddToAllocated(worker.Status.Allocated, assignment, +1)
 			if err := saveWorker(ctx, tx, worker); err != nil {
 				return nil, err
 			}
@@ -138,11 +131,7 @@ func (p *Persistence) BindActorToWorker(ctx context.Context, workerName string, 
 
 		// Subtract before adding: the Actor is already counted, and its
 		// declared size may have changed.
-		allocated, err := resources.AddToAllocated(worker.Status.Allocated, previous, -1)
-		if err != nil {
-			return nil, err
-		}
-		worker.Status.Allocated = allocated
+		worker.Status.Allocated = resources.AddToAllocated(worker.Status.Allocated, previous, -1)
 
 		// Admit against the Worker without the old reservation. An
 		// ActorTemplate is mutable, so a replacement can be larger than what
@@ -153,10 +142,7 @@ func (p *Persistence) BindActorToWorker(ctx context.Context, workerName string, 
 			}
 		}
 
-		if allocated, err = resources.AddToAllocated(allocated, assignment, +1); err != nil {
-			return nil, err
-		}
-		worker.Status.Allocated = allocated
+		worker.Status.Allocated = resources.AddToAllocated(worker.Status.Allocated, assignment, +1)
 
 		// A rebind updates the assignment already recorded, so re-stamping it
 		// as a create would make a retried claim look like a new subresource.
@@ -214,11 +200,7 @@ func (p *Persistence) ReleaseActorFromWorker(ctx context.Context, workerName str
 		if worker.Status == nil {
 			worker.Status = &ateapipb.WorkerStatus{}
 		}
-		allocated, err := resources.AddToAllocated(worker.Status.Allocated, assignment, -1)
-		if err != nil {
-			return nil, err
-		}
-		worker.Status.Allocated = allocated
+		worker.Status.Allocated = resources.AddToAllocated(worker.Status.Allocated, assignment, -1)
 		if err := saveWorker(ctx, tx, worker); err != nil {
 			return nil, err
 		}

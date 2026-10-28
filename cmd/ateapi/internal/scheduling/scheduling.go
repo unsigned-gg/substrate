@@ -22,16 +22,27 @@ import (
 	"math/rand"
 	"slices"
 
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/internal/hardware"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
 // Constraints describes what a worker must satisfy to host an actor.
 type Constraints struct {
-	// SandboxClass must equal the worker's sandbox class. Snapshots are not
-	// portable across sandbox classes, so this is never relaxed.
+	// SandboxClass, when set, is the sandbox class of the snapshot the actor
+	// restores from, and the worker's must equal it. A snapshot's files, its
+	// durable volumes included, are written by one class's worker and read
+	// back by the same, so unlike RequiredRuntime this holds for every
+	// fidelity and is never relaxed. Empty for an actor with no snapshot,
+	// which boots on whichever class its selectors pick.
 	SandboxClass string
+
+	// RequiredRuntime, when it names a runtime, restricts placement to
+	// workers whose DefaultRuntime or RestorableRuntimes can restore a
+	// snapshot stamped with it. Prepared once per Schedule, since Applies
+	// asks it of every candidate.
+	RequiredRuntime hardware.Requirement
 
 	// TemplateSelector and ActorSelector must both match the worker's labels.
 	TemplateSelector labels.Selector
@@ -42,19 +53,20 @@ type Constraints struct {
 	// to specific node VMs.
 	RequiredNodes []string
 
-	// Limits are the actor's declared resource limits, named as a Worker names
-	// the capacity it reports, so the two subtract.
+	// Limits are the actor's declared resource limits, in the units a Worker
+	// reports its capacity in, so the two subtract.
 	Limits *ateapipb.Resources
 }
 
-// ErrNoCapacity is returned by Schedule when no free worker satisfies the
-// constraints.
-var ErrNoCapacity = errors.New("no free workers satisfy the constraints")
+// ErrNoCapacity is returned by Schedule when no worker that meets the
+// constraints has room. The cause can be full workers, or no worker that meets
+// the constraints at all.
+var ErrNoCapacity = errors.New("no worker that meets the constraints has room")
 
 // Scheduler answers placement questions against the current worker fleet.
 type Scheduler interface {
-	// Schedule returns a free worker satisfying constraints.
-	// Returns ErrNoCapacity when no free worker satisfies the requested constraints.
+	// Schedule returns a worker that meets constraints and has room.
+	// Returns ErrNoCapacity when no worker that meets constraints has room.
 	Schedule(ctx context.Context, constraints Constraints) (*ateapipb.Worker, error)
 
 	// Applies reports whether worker satisfies non-capacity constraints. Capacity
@@ -81,8 +93,8 @@ type scheduler struct {
 // Option configures the Scheduler returned by New.
 type Option func(*scheduler)
 
-// WithIntn overrides the random source used to pick among equally suitable
-// workers. n is always >= 1.
+// WithIntn overrides the random source used to sample candidate pairs: when
+// n >= 2 candidates exist, Schedule calls intn(n) and then intn(n-1).
 func WithIntn(intn func(n int) int) Option {
 	return func(s *scheduler) { s.intn = intn }
 }
@@ -96,29 +108,124 @@ func New(source WorkerSource, opts ...Option) Scheduler {
 	return s
 }
 
-// Schedule filters the current worker fleet to find unassigned candidates matching the given constraints.
+// Schedule filters the fleet for eligible candidates with room, samples two at
+// random (power of two choices), and returns the less-loaded one, where load is
+// the higher of actor-slot and compute-resource utilization. Spreading across
+// the warm pool avoids hotspots until autoscaling reclaims idle workers.
 func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ateapipb.Worker, error) {
 	workers, err := s.source.Workers()
 	if err != nil {
 		return nil, fmt.Errorf("while listing workers: %w", err)
 	}
 
-	var candidates []*ateapipb.Worker
+	var candidates []candidate
 	for _, worker := range workers {
-		if s.Applies(worker, constraints) && s.HasRoom(worker, constraints) {
-			candidates = append(candidates, worker)
+		if !s.Applies(worker, constraints) {
+			continue
+		}
+		if cand, ok := checkRoom(worker, constraints.Limits); ok {
+			candidates = append(candidates, cand)
 		}
 	}
 
 	if len(candidates) == 0 {
 		return nil, ErrNoCapacity
 	}
+	if len(candidates) == 1 {
+		return candidates[0].worker, nil
+	}
 
-	return candidates[s.intn(len(candidates))], nil
+	i := s.intn(len(candidates))
+	j := s.intn(len(candidates) - 1)
+	if j >= i {
+		j++
+	}
+	if lessLoaded(&candidates[j], &candidates[i]) {
+		return candidates[j].worker, nil
+	}
+	return candidates[i].worker, nil
+}
+
+// candidate pairs an eligible worker with its cached compute utilization.
+type candidate struct {
+	worker *ateapipb.Worker
+	// resUtil is the worker's dominant compute-resource utilization in [0,1],
+	// or -1 if not yet computed.
+	resUtil float64
+}
+
+func (c *candidate) resourceUtilization() float64 {
+	if c.resUtil < 0 {
+		c.resUtil = workerResourceUtilization(c.worker)
+	}
+	return c.resUtil
+}
+
+// lessLoaded compares dominant utilization — the higher of actor-slot
+// utilization (allocated/capacity) and compute-resource utilization — so either
+// dimension can mark a worker as hot. Ties fall back to actor-slot utilization,
+// then to remaining actor slots.
+func lessLoaded(a, b *candidate) bool {
+	aAlloc := int64(a.worker.GetStatus().GetAllocated().GetActors())
+	bAlloc := int64(b.worker.GetStatus().GetAllocated().GetActors())
+	// checkRoom admits only workers with allocated < capacity, so capacity >= 1.
+	aCap := int64(a.worker.GetStatus().GetCapacity().GetActors())
+	bCap := int64(b.worker.GetStatus().GetCapacity().GetActors())
+
+	aLoad := max(float64(aAlloc)/float64(aCap), a.resourceUtilization())
+	bLoad := max(float64(bAlloc)/float64(bCap), b.resourceUtilization())
+	if aLoad != bLoad {
+		return aLoad < bLoad
+	}
+
+	// Compare slot utilization exactly via cross-multiplication.
+	if lhs, rhs := aAlloc*bCap, bAlloc*aCap; lhs != rhs {
+		return lhs < rhs
+	}
+
+	return aCap-aAlloc > bCap-bAlloc
+}
+
+// workerResourceUtilization returns the highest allocated/capacity ratio across
+// compute dimensions, or 1 when capacity is unreported.
+func workerResourceUtilization(w *ateapipb.Worker) float64 {
+	return utilization(w.GetStatus().GetCapacity(), w.GetStatus().GetAllocated())
+}
+
+func utilization(capacity, used *ateapipb.WorkerResources) float64 {
+	var (
+		maxRatio    float64
+		hasPositive bool
+	)
+	for _, d := range [][2]int64{
+		{capacity.GetCpuMillicores(), used.GetCpuMillicores()},
+		{capacity.GetMemoryBytes(), used.GetMemoryBytes()},
+	} {
+		if d[0] > 0 {
+			hasPositive = true
+			maxRatio = max(maxRatio, float64(d[1])/float64(d[0]))
+		}
+	}
+	if !hasPositive {
+		return 1
+	}
+	return maxRatio
+}
+
+// Registered reports whether worker's current worker process has registered
+// and reported its sandbox class and runtimes. The assignment records the
+// runtime and atelet requires it on Run/Restore, so a worker without one
+// cannot host anything yet.
+func Registered(worker *ateapipb.Worker) bool {
+	return worker.GetStatus().GetRegisteredEpoch() != 0 && hardware.SandboxClass(worker.GetStatus()) != ""
 }
 
 func (s *scheduler) Applies(worker *ateapipb.Worker, constraints Constraints) bool {
-	if worker.GetSandboxClass() != constraints.SandboxClass {
+	if !Registered(worker) {
+		return false
+	}
+	workerClass := hardware.SandboxClass(worker.GetStatus())
+	if constraints.SandboxClass != "" && workerClass != constraints.SandboxClass {
 		return false
 	}
 
@@ -126,49 +233,45 @@ func (s *scheduler) Applies(worker *ateapipb.Worker, constraints Constraints) bo
 		return false
 	}
 
+	if len(constraints.RequiredNodes) > 0 && !slices.Contains(constraints.RequiredNodes, worker.GetNodeName()) {
+		return false
+	}
+
+	if !constraints.RequiredRuntime.WorkerMatches(worker.GetStatus()) {
+		return false
+	}
+
 	set := labels.Set(worker.GetLabels())
 	if constraints.TemplateSelector != nil && !constraints.TemplateSelector.Matches(set) {
 		return false
 	}
-	if constraints.ActorSelector != nil && !constraints.ActorSelector.Matches(set) {
-		return false
-	}
-
-	return len(constraints.RequiredNodes) == 0 || slices.Contains(constraints.RequiredNodes, worker.GetNodeName())
+	return constraints.ActorSelector == nil || constraints.ActorSelector.Matches(set)
 }
 
 // HasRoom reports whether what the worker has left admits one more actor of
 // this size. A dimension the worker does not report is unconstrained, so
 // placement is never blocked by missing data.
-//
-// A worker whose recorded capacity or allocation will not parse is treated as
-// having no room: it is the only answer that cannot overcommit a worker whose
-// true occupancy is unreadable.
 func (s *scheduler) HasRoom(worker *ateapipb.Worker, constraints Constraints) bool {
+	_, ok := checkRoom(worker, constraints.Limits)
+	return ok
+}
+
+func checkRoom(worker *ateapipb.Worker, want *ateapipb.Resources) (candidate, bool) {
 	capacity := worker.GetStatus().GetCapacity()
 	used := worker.GetStatus().GetAllocated()
 
 	// No per-actor size to compare: every assignment costs one, so a worker at
 	// its limit has no room however small the next actor is.
 	if used.GetActors() >= capacity.GetActors() {
-		return false
+		return candidate{}, false
 	}
 
-	want, err := resources.ParseQuantities(constraints.Limits)
-	if err != nil || len(want) == 0 {
-		return err == nil
+	if want.GetCpuMillicores() == 0 && want.GetMemoryBytes() == 0 {
+		return candidate{worker: worker, resUtil: -1}, true
 	}
-	free, err := resources.ParseQuantities(capacity.GetResources())
-	if err != nil {
-		return false
+	if !resources.Covers(resources.Free(capacity, used), want) {
+		return candidate{}, false
 	}
-	if free == nil {
-		free = resources.Quantities{}
-	}
-	allocated, err := resources.ParseQuantities(used.GetResources())
-	if err != nil {
-		return false
-	}
-	free.Sub(allocated)
-	return free.Covers(want)
+	resUtil := utilization(capacity, used)
+	return candidate{worker: worker, resUtil: resUtil}, true
 }

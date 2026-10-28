@@ -59,10 +59,32 @@ func NotFound(format string, args ...any) error {
 	return newf(codes.NotFound, format, args...)
 }
 
+// AlreadyExists reports that a resource the request creates already exists.
+func AlreadyExists(format string, args ...any) error {
+	return newf(codes.AlreadyExists, format, args...)
+}
+
 // FailedPrecondition reports that the system is not in the state the request
 // requires. Retrying is pointless until that state changes.
 func FailedPrecondition(format string, args ...any) error {
 	return newf(codes.FailedPrecondition, format, args...)
+}
+
+// Aborted reports a request that lost a concurrency conflict, such as a
+// version mismatch. Retrying from a fresh read can succeed.
+func Aborted(format string, args ...any) error {
+	return newf(codes.Aborted, format, args...)
+}
+
+// PermissionDenied reports an authenticated caller that may not perform the
+// request.
+func PermissionDenied(format string, args ...any) error {
+	return newf(codes.PermissionDenied, format, args...)
+}
+
+// Unauthenticated reports a caller whose identity could not be established.
+func Unauthenticated(format string, args ...any) error {
+	return newf(codes.Unauthenticated, format, args...)
 }
 
 // ResourceExhausted reports that a quota or capacity limit refused the
@@ -76,10 +98,16 @@ func Unimplemented(format string, args ...any) error {
 	return newf(codes.Unimplemented, format, args...)
 }
 
-// Unavailable reports that the request was not acted on, so retrying it, here
-// or elsewhere, is safe. Never use it for a failure partway through.
+// Unavailable reports that the request was not acted on, or that the attempt
+// was rolled back so retrying it, here or elsewhere, is safe. Never use it for
+// a failure that leaves partial state behind.
 func Unavailable(format string, args ...any) error {
 	return newf(codes.Unavailable, format, args...)
+}
+
+// DataLoss reports unrecoverable loss or corruption of data.
+func DataLoss(format string, args ...any) error {
+	return newf(codes.DataLoss, format, args...)
 }
 
 // Internal reports a server-side failure with a message chosen for the

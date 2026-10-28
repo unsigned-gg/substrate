@@ -21,9 +21,9 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/agent-substrate/substrate/internal/e2e"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/internal/e2e"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 )
 
 const (
@@ -74,7 +74,7 @@ func TestActorSizing_SandboxObservesDeclaredLimits(t *testing.T) {
 	const id = "sized-actor"
 	createAndResumeActor(t, ctx, clients, id)
 
-	rc, err := e2e.NewRouterClient(ctx)
+	rc, err := e2e.NewRouterClient(t, ctx)
 	if err != nil {
 		t.Fatalf("NewRouterClient: %v", err)
 	}
@@ -114,7 +114,7 @@ func deploySizedProbe(t *testing.T, ctx context.Context, clients *e2e.Clients, b
 	e2e.DeploySubstrateFixture(t, ctx, clients, e2e.SubstrateFixtureManifests{
 		Pool:     "internal/e2e/fixtures/probe/probe-sized.yaml.tmpl",
 		Template: "internal/e2e/fixtures/probe/probe-sized-template.yaml.tmpl",
-	}, bucket, "sizing", false)
+	}, bucket, "sizing", nil)
 }
 
 func createAndResumeActor(t *testing.T, ctx context.Context, clients *e2e.Clients, id string) {

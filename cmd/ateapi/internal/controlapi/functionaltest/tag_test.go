@@ -19,11 +19,11 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/go-cmp/cmp"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/testing/protocmp"
 )
@@ -47,43 +47,31 @@ func seedTag(t *testing.T, tc *testContext, actorName, tagName string, opts ...f
 		t.Fatalf("NewActorSnapshotURI: %v", err)
 	}
 	actor, err = tc.persistence.UpdateActor(ctx, resources.ActorRefFromActor(actor), store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
-		toUpdate.Status.ExternalSnapshot = &ateapipb.ExternalSnapshot{SnapshotUri: actorSnapshotURI.String(), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL}
+		toUpdate.Status.LastAssignedGeneration = 1
+		toUpdate.Status.Snapshots = []*ateapipb.Snapshot{
+			newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", actorSnapshotURI.Name(), actorSnapshotURI.String()),
+		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("recording the actor's external snapshot: %v", err)
+	}
+	uri, err := resources.NewTagSnapshotURI(testStorageLocation, testAtespace, resources.NewSnapshotName())
+	if err != nil {
+		t.Fatalf("NewTagSnapshotURI: %v", err)
 	}
 	tag := &ateapipb.Tag{
 		Metadata:    &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: tagName},
 		Scope:       ateapipb.TagScope_TAG_SCOPE_ATESPACE,
 		SourceActor: resources.ActorRefFromActor(actor).ToObjectRef(),
 		Status: &ateapipb.TagStatus{
-			Snapshot:        &ateapipb.ExternalSnapshot{ContentScope: actor.GetStatus().GetExternalSnapshot().GetContentScope()},
-			StorageLocation: testStorageLocation,
+			Snapshot: newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG, durableSnapshot(actor.GetStatus()).GetFidelity(), "", uri.Name(), uri.String()),
 		},
 	}
 	for _, opt := range opts {
 		opt(tag)
 	}
-	snapshot := tag.Status.Snapshot
-	tag.Status.Snapshot = nil
-	tag = storetest.MustCreateTag(t, ctx, tc.persistence, tag)
-	if snapshot == nil {
-		return tag
-	}
-	uri, err := resources.NewTagSnapshotURI(testStorageLocation, testAtespace, tag.GetMetadata().GetUid())
-	if err != nil {
-		t.Fatalf("NewTagSnapshotURI: %v", err)
-	}
-	snapshot.SnapshotUri = uri.String()
-	tag, err = tc.persistence.UpdateTag(ctx, resources.TagRefFromTag(tag), store.PreconditionFrom(tag), func(toUpdate *ateapipb.Tag) error {
-		toUpdate.Status.Snapshot = snapshot
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("finalizing tag: %v", err)
-	}
-	return tag
+	return storetest.MustCreateTag(t, ctx, tc.persistence, tag)
 }
 
 // TestCreateTag_ReusedTagName tests that a tag does not move
@@ -111,7 +99,7 @@ func TestCreateTag_ReusedTagName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTag(actor-a) failed: %v", err)
 	}
-	tagSnapshotURI := first.GetStatus().GetSnapshot().GetSnapshotUri()
+	tagSnapshotURI := tagSnapshotURI(first)
 	// Tag owns a snapshot. So it must not be empty.
 	wantObjects := snapshotObjectNames(t, tc, tagSnapshotURI)
 	if len(wantObjects) == 0 {
@@ -163,6 +151,74 @@ func TestCreateTag_ReusedTagName(t *testing.T) {
 	}
 }
 
+// TestCreateTag_FromPausedActor verifies that tagging a suspended actor whose
+// local snapshot is not uploaded yet has the atelet on its node upload the
+// node-local snapshot first, and tags that snapshot. The actor keeps the
+// snapshot on its node.
+func TestCreateTag_FromPausedActor(t *testing.T) {
+	ns := namespaceForTest("ns-tag-paused")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+
+	ctx := context.Background()
+	ref := &ateapipb.ObjectRef{Atespace: testAtespace, Name: "actor-paused"}
+	if _, err := tc.client.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: ref.GetAtespace(), Name: ref.GetName()},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
+	}}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: ref}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	if _, err := tc.client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
+		Actor:   ref,
+		Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
+	}); err != nil {
+		t.Fatalf("pause failed: %v", err)
+	}
+	paused, err := tc.client.GetActor(ctx, &ateapipb.GetActorRequest{Actor: ref})
+	if err != nil {
+		t.Fatalf("GetActor failed: %v", err)
+	}
+	pausedSnap := localSnapshot(paused.GetStatus())
+	if pausedSnap == nil {
+		t.Fatal("paused actor has no local snapshot")
+	}
+
+	tag, err := tc.client.CreateTag(ctx, &ateapipb.CreateTagRequest{
+		Tag: &ateapipb.Tag{
+			Metadata:    &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "from-paused"},
+			Scope:       ateapipb.TagScope_TAG_SCOPE_ATESPACE,
+			SourceActor: ref,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTag failed: %v", err)
+	}
+
+	if got := tc.fakeAtelet.PromoteRequest.GetSnapshot().GetSnapshotUuid(); got != pausedSnap.GetUuid() {
+		t.Errorf("PromoteSnapshot snapshot uuid = %q, want the paused snapshot %q", got, pausedSnap.GetUuid())
+	}
+	if len(snapshotObjectNames(t, tc, tagSnapshotURI(tag))) == 0 {
+		t.Errorf("the tag's external snapshot %s is empty", tagSnapshotURI(tag))
+	}
+	stored, err := tc.client.GetActor(ctx, &ateapipb.GetActorRequest{Actor: ref})
+	if err != nil {
+		t.Fatalf("GetActor failed: %v", err)
+	}
+	// The node-local snapshot is now durable and stays on its node.
+	if got := durableSnapshot(stored.GetStatus()); got.GetUuid() != pausedSnap.GetUuid() {
+		t.Errorf("latest durable snapshot = %v, want the paused snapshot %q", got, pausedSnap.GetUuid())
+	}
+	if got := localSnapshot(stored.GetStatus()); got.GetUuid() != pausedSnap.GetUuid() {
+		t.Errorf("local snapshot = %v, want the paused snapshot %q kept on its node", got, pausedSnap.GetUuid())
+	}
+}
+
 // suspendActorForTest creates, resumes and suspends an actor on workerName,
 // and returns the URI of the external snapshot the suspend wrote.
 func suspendActorForTest(t *testing.T, tc *testContext, workerName, name string) string {
@@ -184,12 +240,13 @@ func suspendActorForTest(t *testing.T, tc *testContext, workerName, name string)
 		t.Fatalf("ResumeActor(%s) failed: %v", name, err)
 	}
 	suspended, err := tc.client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
-		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		Actor:   &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
 	})
 	if err != nil {
 		t.Fatalf("SuspendActor(%s) failed: %v", name, err)
 	}
-	uri := suspended.GetActor().GetStatus().GetExternalSnapshot().GetSnapshotUri()
+	uri := durableSnapshotURI(suspended.GetActor().GetStatus())
 	if uri == "" {
 		t.Fatalf("SuspendActor(%s) wrote no external snapshot: %v", name, suspended)
 	}
@@ -303,6 +360,36 @@ func TestUpdateTag_NotFound(t *testing.T) {
 		},
 	})
 	assertGrpcError(t, err, codes.NotFound, "Tag test-atespace/does-not-exist not found")
+}
+
+func TestDeleteTag(t *testing.T) {
+	ns := namespaceForTest("ns-delete-tag")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+	ctx := context.Background()
+	createTemplate(t, tc, ns)
+
+	created := seedTag(t, tc, "actor-1", "v1")
+	tagRef := resources.TagRefFromTag(created)
+	snapshotURI, err := resources.ParseSnapshotURI(tagSnapshotURI(created))
+	if err != nil {
+		t.Fatalf("ParseSnapshotURI: %v", err)
+	}
+	tc.objectStore.PutSnapshot(t, snapshotURI, "manifest.json")
+
+	deleted, err := tc.client.DeleteTag(ctx, &ateapipb.DeleteTagRequest{Tag: tagRef.ToObjectRef()})
+	if err != nil {
+		t.Fatalf("DeleteTag failed: %v", err)
+	}
+	if diff := cmp.Diff(created, deleted, protocmp.Transform(), ignoreVersion, ignoreTimestamps); diff != "" {
+		t.Errorf("DeleteTag response mismatch (-created +deleted):\n%s", diff)
+	}
+	if deleted.GetMetadata().GetDeleteTime() == nil {
+		t.Errorf("the deleted tag carries no delete_time")
+	}
+	assertSnapshotCollected(t, tc, snapshotURI.String())
+	_, err = tc.client.GetTag(ctx, &ateapipb.GetTagRequest{Tag: tagRef.ToObjectRef()})
+	assertGrpcError(t, err, codes.NotFound, "Tag "+tagRef.String()+" not found")
 }
 
 func TestDeleteTag_NotFound(t *testing.T) {

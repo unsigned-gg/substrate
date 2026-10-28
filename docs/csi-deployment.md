@@ -32,12 +32,15 @@ Standard CSI controller deployments can be made network-accessible and secured i
 
 Create a Kubernetes `Service` targeting the CSI Controller pods. This provides a stable DNS name and load balancing across controller replicas.
 
+Create the `Service` before the controller pods when the proxy's serving certificate comes from Substrate's `servicedns.podcert.ate.dev/identity` signer: it issues the certificate for the `<service>.<namespace>.svc` names of the `Service`s selecting the pod, and refuses to issue one for a pod no `Service` selects yet. The `Service` name is also what `spec.tls.serverName` in the `CSIDriverConfig` must be.
+
 ### Securing with mTLS and Pod Identity
 
 When exposing the CSI Controller over the network, communication should be secured with mutual TLS (mTLS). In the [`CSIDriverConfig`](csi-volumes.md#2-dynamic-csi-driver-discovery-csidriverconfig) resource, configure the following fields under `spec.tls`:
 
 * `enabled: true`: Enables TLS/mTLS for gRPC communication between `ateapi` and the CSI Controller service. If `false` (or omitted), communication falls back to unencrypted plaintext gRPC.
 * `usePodIdentity: true`: Instructs `ateapi` to authenticate using Substrate's SPIFFE Pod Identity client certificate (`/run/podidentity.podcert.ate.dev/credential-bundle.pem`) and verify the controller's server certificate using Substrate's dynamic Service DNS CA trust bundle (`/run/servicedns.podcert.ate.dev/trust-bundle.pem`).
+* `serverName: <hostname-or-ip>`: Specifies the expected Subject Alternative Name (SAN) of the controller for TLS certificate verification. Required when `enabled` is `true`.
 
 > [!IMPORTANT]
 > **What happens if `usePodIdentity` is `false`?**
@@ -203,9 +206,19 @@ spec:
       # Envoy proxy sidecar terminating mTLS and forwarding to /csi/csi.sock
       - name: envoy-proxy
         image: envoyproxy/envoy:v1.34-latest
+        command:
+        - "/usr/local/bin/envoy"
         args:
         - "-c"
         - "/etc/envoy/envoy.yaml"
+        # The proxy needs no privilege, only to be able to connect to the
+        # driver's socket, which the nfs container creates root-only.
+        securityContext:
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         volumeMounts:
         - name: socket-dir
           mountPath: /csi
@@ -272,7 +285,10 @@ spec:
   tls:
     enabled: true
     usePodIdentity: true
-    serverName: csi-nfs-controller.kube-system.svc.cluster.local
+    # The one DNS name servicednssigner puts in the proxy's certificate is
+    # <service>.<namespace>.svc, so that, not the cluster.local form the
+    # endpoint dials, is the server name to verify.
+    serverName: csi-nfs-controller.kube-system.svc
 ```
 
 ---
@@ -283,7 +299,7 @@ The CSI Node plugin runs as a DaemonSet on each worker node and handles `NodeSta
 
 ### Mount Propagation Requirements
 
-When the CSI Node plugin mounts an external volume (such as an NFS share or a formatted block device), the filesystem mount is created inside the plugin container. For Substrate's node supervisor (`atelet`) and worker sandboxes (`ateom-gvisor`) on the host to see this filesystem mount, the following requirements must be met:
+When the CSI Node plugin mounts an external volume (such as an NFS share or a formatted block device), the filesystem mount is created inside the plugin container. For Substrate's node supervisor (`atelet`) and worker sandboxes (`ateworker-gvisor`) on the host to see this filesystem mount, the following requirements must be met:
 
 1. **Bidirectional Mount Propagation (`mountPropagation: Bidirectional`):** The volume mount on the host Substrate target directory (e.g. `/var/lib/ate`) in the CSI Node plugin container must have `mountPropagation: Bidirectional`. This ensures that any mounts made by the CSI plugin inside the container propagate back to the host filesystem.
 2. **Unix Domain Socket Accessibility:** The CSI Node plugin must place its Unix domain socket under `/var/lib/kubelet/plugins/<driverName>/` (or the path defined in `CSIDriverConfig.spec.nodeSocketOverride`), which is shared with `atelet`.
@@ -333,7 +349,7 @@ spec:
         - name: socket-dir
           mountPath: /csi
         # Target directory with bidirectional mount propagation
-        - name: ateom-dir
+        - name: ate-base
           mountPath: /var/lib/ate
           mountPropagation: Bidirectional
       volumes:
@@ -341,7 +357,7 @@ spec:
         hostPath:
           path: /var/lib/kubelet/plugins/csi-nfsplugin
           type: DirectoryOrCreate
-      - name: ateom-dir
+      - name: ate-base
         hostPath:
           path: /var/lib/ate
           type: DirectoryOrCreate

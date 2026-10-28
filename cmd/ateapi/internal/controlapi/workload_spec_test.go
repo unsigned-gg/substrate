@@ -17,9 +17,9 @@ package controlapi
 import (
 	"testing"
 
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/go-cmp/cmp"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/protobuf/testing/protocmp"
 )
 
@@ -50,8 +50,8 @@ func TestWorkloadSpecFromActorTemplate(t *testing.T) {
 			want: &ateletpb.WorkloadSpec{
 				Volumes: []*ateletpb.Volume{
 					{
-						Name:   "home",
-						Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}},
+						Name:       "home",
+						DurableDir: &ateletpb.DurableDirVolumeSource{},
 					},
 				},
 				Containers: []*ateletpb.Container{
@@ -100,19 +100,15 @@ func TestWorkloadSpecFromActorTemplate(t *testing.T) {
 				Volumes: []*ateletpb.Volume{
 					{
 						Name: "system-info",
-						Source: &ateletpb.Volume_SystemInfo{
-							SystemInfo: &ateletpb.SystemInfoVolume{
-								DataSources: []*ateletpb.SystemInfoDataSource{
-									{DataSource: &ateletpb.SystemInfoDataSource_ActorMetadata{
-										ActorMetadata: &ateletpb.ActorMetadataDataSource{
-											Items: []*ateletpb.ActorMetadataItem{
-												{Field: ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_NAME, Path: "actor-name"},
-												{Field: ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_ATESPACE, Path: "atespace"},
-												{Field: ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_UID, Path: "identity/actor-uid"},
-											},
-										},
-									}},
-								},
+						SystemInfo: &ateletpb.SystemInfoVolumeSource{
+							DataSources: []*ateletpb.SystemInfoDataSource{
+								{ActorMetadata: &ateletpb.ActorMetadataDataSource{
+									Items: []*ateletpb.ActorMetadataItem{
+										{Field: ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_NAME, Path: "actor-name"},
+										{Field: ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_ATESPACE, Path: "atespace"},
+										{Field: ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_UID, Path: "identity/actor-uid"},
+									},
+								}},
 							},
 						},
 					},
@@ -150,12 +146,12 @@ func TestWorkloadSpecFromActorTemplate(t *testing.T) {
 			want: &ateletpb.WorkloadSpec{
 				Volumes: []*ateletpb.Volume{
 					{
-						Name:   "home",
-						Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}},
+						Name:       "home",
+						DurableDir: &ateletpb.DurableDirVolumeSource{},
 					},
 					{
-						Name:   "agent",
-						Source: &ateletpb.Volume_Image{Image: &ateletpb.ImageVolumeSource{Reference: "example.com/agent@sha256:abc"}},
+						Name:  "agent",
+						Image: &ateletpb.ImageVolumeSource{Reference: "example.com/agent@sha256:abc"},
 					},
 				},
 				Containers: []*ateletpb.Container{
@@ -200,13 +196,9 @@ func TestWorkloadSpecFromActorTemplate(t *testing.T) {
 				Volumes: []*ateletpb.Volume{
 					{
 						Name: "system-info",
-						Source: &ateletpb.Volume_SystemInfo{
-							SystemInfo: &ateletpb.SystemInfoVolume{
-								DataSources: []*ateletpb.SystemInfoDataSource{
-									{DataSource: &ateletpb.SystemInfoDataSource_TrustBundle{
-										TrustBundle: &ateletpb.TrustBundleDataSource{Names: []string{"egress-trust"}, Path: "trust/ca.pem"},
-									}},
-								},
+						SystemInfo: &ateletpb.SystemInfoVolumeSource{
+							DataSources: []*ateletpb.SystemInfoDataSource{
+								{TrustBundle: &ateletpb.TrustBundleDataSource{Names: []string{"egress-trust"}, Path: "trust/ca.pem"}},
 							},
 						},
 					},
@@ -243,8 +235,8 @@ func TestWorkloadSpecFromActorTemplate(t *testing.T) {
 			want: &ateletpb.WorkloadSpec{
 				Volumes: []*ateletpb.Volume{
 					{
-						Name:   "home",
-						Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}},
+						Name:       "home",
+						DurableDir: &ateletpb.DurableDirVolumeSource{},
 					},
 				},
 				Containers: []*ateletpb.Container{
@@ -272,8 +264,8 @@ func TestWorkloadSpecFromActorTemplate(t *testing.T) {
 			want: &ateletpb.WorkloadSpec{
 				Volumes: []*ateletpb.Volume{
 					{
-						Name:   "home",
-						Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}},
+						Name:       "home",
+						DurableDir: &ateletpb.DurableDirVolumeSource{},
 					},
 				},
 				Containers: []*ateletpb.Container{{Name: "main", Image: "main"}},
@@ -298,7 +290,7 @@ func TestWorkloadSpecFromActorTemplate(t *testing.T) {
 				Containers: []*ateletpb.Container{{
 					Name:  "main",
 					Image: "main",
-					Env: []*ateletpb.EnvEntry{
+					Env: []*ateletpb.EnvVar{
 						{Name: "LITERAL", Value: "plain"},
 						{Name: "EMPTY", Value: ""},
 					},
@@ -331,7 +323,7 @@ func TestWorkloadSpecFromActorTemplate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := workloadSpecFromActorTemplate(tt.template, nil)
+			got, err := workloadSpecFromActorTemplate(tt.template, nil, nil)
 			if err != nil {
 				t.Fatalf("workloadSpecFromActorTemplate failed: %v", err)
 			}
@@ -349,8 +341,8 @@ func TestWorkloadSpecFromActorTemplatePropagatesWakeupProbe(t *testing.T) {
 			{
 				Name:  "with-probe",
 				Image: "main",
-				WakeupProbe: &ateapipb.ContainerWakeupProbe{
-					HttpGet:        &ateapipb.HTTPGetAction{Path: "/health", Port: 8080},
+				WakeupProbe: &ateapipb.WakeupProbe{
+					HttpGet:        &ateapipb.HttpGetAction{Path: "/health", Port: 8080},
 					TimeoutSeconds: 45,
 				},
 			},
@@ -359,7 +351,7 @@ func TestWorkloadSpecFromActorTemplatePropagatesWakeupProbe(t *testing.T) {
 				Image: "side",
 			},
 		},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("workloadSpecFromActorTemplate failed: %v", err)
 	}
@@ -370,7 +362,7 @@ func TestWorkloadSpecFromActorTemplatePropagatesWakeupProbe(t *testing.T) {
 				Name:  "with-probe",
 				Image: "main",
 				WakeupProbe: &ateletpb.WakeupProbe{
-					HttpGet:        &ateletpb.HTTPGetAction{Path: "/health", Port: 8080},
+					HttpGet:        &ateletpb.HttpGetAction{Path: "/health", Port: 8080},
 					TimeoutSeconds: 45,
 				},
 			},
@@ -398,9 +390,9 @@ func TestAppendExternalVolumes(t *testing.T) {
 		Volumes: []*ateapipb.Volume{
 			{
 				Name: "vol-1",
-				ExternalVolumeTemplate: &ateapipb.ExternalVolumeTemplate{
+				External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 					StorageClassName: "pd-standard",
-				},
+				}},
 			},
 			{
 				Name:       "vol-2",
@@ -408,9 +400,9 @@ func TestAppendExternalVolumes(t *testing.T) {
 			},
 			{
 				Name: "unmounted-vol",
-				ExternalVolumeTemplate: &ateapipb.ExternalVolumeTemplate{
+				External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 					StorageClassName: "pd-standard",
-				},
+				}},
 			},
 		},
 	}
@@ -421,39 +413,55 @@ func TestAppendExternalVolumes(t *testing.T) {
 			Name:     "actor-123",
 		},
 		Status: &ateapipb.ActorStatus{
-			ActorVolumes: []*ateapipb.ExternalVolume{
+			ExternalVolumes: &ateapipb.ExternalVolumes{Volumes: []*ateapipb.ExternalVolumeStatus{
 				{
-					VolumeName:      "vol-1",
+					Name:            "vol-1",
 					StorageVolumeId: "vol-gce-pd-123",
 					VolumeType:      "pd-standard",
 					VolumeContext:   map[string]string{"foo": "bar"},
 				},
-			},
+			}},
 		},
 	}
 
-	workloadSpec := &ateletpb.WorkloadSpec{}
-	if err := appendExternalVolumes(workloadSpec, template, actor); err != nil {
-		t.Fatalf("appendExternalVolumes unexpected error: %v", err)
-	}
+	for _, tt := range []struct {
+		name                  string
+		volumePublishContexts map[string]map[string]string
+		wantPublishCtx        map[string]string
+	}{
+		{
+			name:                  "with attachment metadata",
+			volumePublishContexts: map[string]map[string]string{"vol-1": {"devicePath": "/dev/xvdba"}},
+			wantPublishCtx:        map[string]string{"devicePath": "/dev/xvdba"},
+		},
+		{
+			name: "without attachment metadata",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			workloadSpec := &ateletpb.WorkloadSpec{}
+			if err := appendExternalVolumes(workloadSpec, template, actor, tt.volumePublishContexts); err != nil {
+				t.Fatalf("appendExternalVolumes unexpected error: %v", err)
+			}
 
-	want := &ateletpb.WorkloadSpec{
-		Volumes: []*ateletpb.Volume{
-			{
-				Name: "vol-1",
-				Source: &ateletpb.Volume_External{
-					External: &ateletpb.ExternalVolumeSource{
-						StorageVolumeId: "vol-gce-pd-123",
-						VolumeType:      "pd-standard",
-						VolumeContext:   map[string]string{"foo": "bar"},
+			want := &ateletpb.WorkloadSpec{
+				Volumes: []*ateletpb.Volume{
+					{
+						Name: "vol-1",
+						External: &ateletpb.ExternalVolumeSource{
+							StorageVolumeId: "vol-gce-pd-123",
+							VolumeType:      "pd-standard",
+							VolumeContext:   map[string]string{"foo": "bar"},
+							PublishContext:  tt.wantPublishCtx,
+						},
 					},
 				},
-			},
-		},
-	}
+			}
 
-	if diff := cmp.Diff(want, workloadSpec, protocmp.Transform()); diff != "" {
-		t.Errorf("appendExternalVolumes mismatch (-want +got):\n%s", diff)
+			if diff := cmp.Diff(want, workloadSpec, protocmp.Transform()); diff != "" {
+				t.Errorf("appendExternalVolumes mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 
 	// Test missing mounted volume returns an error
@@ -462,9 +470,9 @@ func TestAppendExternalVolumes(t *testing.T) {
 			Atespace: "space-abc",
 			Name:     "actor-123",
 		},
-		Status: &ateapipb.ActorStatus{ActorVolumes: []*ateapipb.ExternalVolume{}},
+		Status: &ateapipb.ActorStatus{ExternalVolumes: &ateapipb.ExternalVolumes{Volumes: []*ateapipb.ExternalVolumeStatus{}}},
 	}
-	if err := appendExternalVolumes(&ateletpb.WorkloadSpec{}, template, missingActor); err == nil {
+	if err := appendExternalVolumes(&ateletpb.WorkloadSpec{}, template, missingActor, nil); err == nil {
 		t.Errorf("appendExternalVolumes expected error for missing volume, got nil")
 	}
 }
@@ -495,7 +503,7 @@ func TestWorkloadSpecFromActorTemplatePropagatesSecurityContext(t *testing.T) {
 				SecurityContext: &ateapipb.SecurityContext{Capabilities: &ateapipb.Capabilities{}},
 			},
 		},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("workloadSpecFromActorTemplate failed: %v", err)
 	}
@@ -529,65 +537,42 @@ func TestWorkloadSpecFromActorTemplatePropagatesSecurityContext(t *testing.T) {
 
 func TestToAteletResources(t *testing.T) {
 	tests := []struct {
-		name    string
-		in      *ateapipb.Resources
-		want    *ateletpb.ResourceLimits
-		wantErr bool
+		name string
+		in   *ateapipb.ResourceRequirements
+		want *ateletpb.ResourceRequirements
 	}{{
 		name: "nil resources",
 		in:   nil,
 		want: nil,
 	}, {
-		name: "empty limits",
-		in:   &ateapipb.Resources{},
+		name: "empty resources",
+		in:   &ateapipb.ResourceRequirements{},
 		want: nil,
 	}, {
 		name: "memory only",
-		in:   &ateapipb.Resources{Limits: []*ateapipb.Limits{{Name: "memory", Quantity: "256Mi"}}},
-		want: &ateletpb.ResourceLimits{MemoryBytes: 268435456},
+		in:   &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{MemoryBytes: 256 << 20}},
+		want: &ateletpb.ResourceRequirements{Limits: &ateletpb.Resources{MemoryBytes: 268435456}},
 	}, {
 		name: "cpu only",
-		in:   &ateapipb.Resources{Limits: []*ateapipb.Limits{{Name: "cpu", Quantity: "200m"}}},
-		want: &ateletpb.ResourceLimits{CpuMillis: 200},
+		in:   &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{CpuMillicores: 200}},
+		want: &ateletpb.ResourceRequirements{Limits: &ateletpb.Resources{CpuMillicores: 200}},
 	}, {
 		name: "both",
-		in: &ateapipb.Resources{Limits: []*ateapipb.Limits{
-			{Name: "cpu", Quantity: "1"},
-			{Name: "memory", Quantity: "1Gi"},
-		}},
-		want: &ateletpb.ResourceLimits{MemoryBytes: 1073741824, CpuMillis: 1000},
-	}, {
-		name:    "invalid quantity",
-		in:      &ateapipb.Resources{Limits: []*ateapipb.Limits{{Name: "cpu", Quantity: "banana"}}},
-		wantErr: true,
+		in:   &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{CpuMillicores: 1000, MemoryBytes: 1 << 30}},
+		want: &ateletpb.ResourceRequirements{Limits: &ateletpb.Resources{MemoryBytes: 1073741824, CpuMillicores: 1000}},
 	}}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := toAteletResources(tc.in)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("toAteletResources() error = nil, want parse error")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("toAteletResources() failed: %v", err)
-			}
+			got := toAteletResources(tc.in)
 			if tc.want == nil {
 				if got != nil {
 					t.Fatalf("toAteletResources() = %v, want nil", got)
 				}
 				return
 			}
-			if got == nil {
-				t.Fatalf("toAteletResources() = nil, want %v", tc.want)
-			}
-			if got.GetMemoryBytes() != tc.want.GetMemoryBytes() {
-				t.Errorf("memory_bytes = %d, want %d", got.GetMemoryBytes(), tc.want.GetMemoryBytes())
-			}
-			if got.GetCpuMillis() != tc.want.GetCpuMillis() {
-				t.Errorf("cpu_millis = %d, want %d", got.GetCpuMillis(), tc.want.GetCpuMillis())
+			if diff := cmp.Diff(tc.want, got, protocmp.Transform()); diff != "" {
+				t.Errorf("toAteletResources() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -599,20 +584,16 @@ func TestToAteletResources(t *testing.T) {
 // ate-api-server.
 func TestWorkloadSpecFromActorTemplatePropagatesResources(t *testing.T) {
 	got, err := workloadSpecFromActorTemplate(&ateapipb.ActorTemplate{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: "agent-ns", Name: "tmpl-limits"},
-		SandboxConfig: &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM},
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "agent-ns", Name: "tmpl-limits"},
 		Containers: []*ateapipb.Container{
 			{
-				Name:  "limited",
-				Image: "main",
-				Resources: &ateapipb.Resources{Limits: []*ateapipb.Limits{
-					{Name: "cpu", Quantity: "200m"},
-					{Name: "memory", Quantity: "256Mi"},
-				}},
+				Name:      "limited",
+				Image:     "main",
+				Resources: &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{CpuMillicores: 200, MemoryBytes: 256 << 20}},
 			},
 			{Name: "unlimited", Image: "main"},
 		},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("workloadSpecFromActorTemplate failed: %v", err)
 	}
@@ -624,11 +605,11 @@ func TestWorkloadSpecFromActorTemplatePropagatesResources(t *testing.T) {
 	if limited == nil {
 		t.Fatal("limited container Resources = nil, want the declared limits")
 	}
-	if limited.GetMemoryBytes() != 268435456 {
-		t.Errorf("memory_bytes = %d, want 268435456", limited.GetMemoryBytes())
+	if got := limited.GetLimits().GetMemoryBytes(); got != 268435456 {
+		t.Errorf("memory_bytes = %d, want 268435456", got)
 	}
-	if limited.GetCpuMillis() != 200 {
-		t.Errorf("cpu_millis = %d, want 200", limited.GetCpuMillis())
+	if got := limited.GetLimits().GetCpuMillicores(); got != 200 {
+		t.Errorf("cpu_millicores = %d, want 200", got)
 	}
 	if r := got.GetContainers()[1].GetResources(); r != nil {
 		t.Errorf("unlimited container Resources = %v, want nil", r)

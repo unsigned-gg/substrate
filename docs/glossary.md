@@ -9,7 +9,9 @@ For how the pieces fit together, see the [Architecture](architecture.md) and
 
 - **ActorTemplate** (ate API resource): the definition of an actor "class":
   the container image(s) and snapshot configuration. Creating an
-  `ActorTemplate` triggers creation of a [Golden Snapshot](#snapshots). It is
+  `ActorTemplate` triggers creation of a [Golden Snapshot](#snapshots) by
+  default. Set `snapshotConfig.goldenSnapshotConfig.mode` to
+  `GOLDEN_SNAPSHOT_MODE_DISABLED` to skip it. The template is
   treated as immutable: you create a new template for a new version rather
   than editing an existing one. It is analogous to a Pod template, but for a
   checkpointable workload. ActorTemplates are created and managed through the
@@ -22,11 +24,10 @@ For how the pieces fit together, see the [Architecture](architecture.md) and
 
 - **SandboxConfig** (Kubernetes CRD): a cluster-scoped resource holding the
   sandbox binaries for one runtime family (the gVisor `runsc` binary, or a
-  micro-VM kernel/firmware/config), plus the pause image for the sandbox's
-  root container. An actor resolves its sandbox at first cold boot from the
-  config its `ActorTemplate` names (naming one is currently required;
-  per-class cluster defaults are planned), so one config pins the runtime
-  version for many templates.
+  micro-VM kernel/firmware/config). An actor resolves its sandbox at first cold
+  boot from the config its `ActorTemplate` names (naming one is currently
+  required; per-class cluster defaults are planned), so one config pins the
+  runtime version for many templates.
 
 ## Records (dynamic state, in the control-plane store)
 
@@ -59,13 +60,15 @@ for etcd.
   example, it turns a `WorkerPool` into a `Deployment`).
 
 - **atelet**: the node-level supervisor, run as a DaemonSet. It pulls images,
-  assembles OCI bundles, drives the sandbox lifecycle on the node via ateom,
+  assembles OCI bundles, drives the sandbox lifecycle on the node via ateworker,
   and streams snapshots to and from snapshot storage.
 
-- **ateom**: the coordinator that runs inside each worker pod and drives the
+- **ateworker**: the coordinator that runs inside each worker pod and drives the
   sandbox runtime on behalf of atelet. This decouples the physical pod
   lifecycle from the sandboxed agent process. It embeds a networking service
   called `atunnel` that handles network traffic for the sandboxed Actor.
+  ateworker is Substrate's worker implementation, one binary per sandbox class
+  (`ateworker-gvisor`, `ateworker-microvm`).
 
 - **atenet**: the networking stack. Its router resumes suspended Actors on
   demand and routes traffic to the right worker pod.
@@ -79,58 +82,58 @@ for etcd.
 
 ## Lifecycle
 
-- **Suspend**: hibernate a running or paused Actor into a durable snapshot in
-  external storage. A running Actor is checkpointed on its Worker (which is
-  then freed); a paused Actor's node-local snapshot is uploaded — narrowed to
-  the commit scope when the pause captured more — ending its node pinning.
+- **Suspend**: hibernate a running Actor into a snapshot. The Actor is
+  checkpointed on its Worker, which is then freed. Snapshot files remain on the
+  node VM so the following Resume can restore from them locally (until `atelet`
+  or a Resume detaches them), and are also uploaded to external storage: a
+  synchronous suspend uploads the snapshot before it returns, while an
+  asynchronous suspend (the default) returns once the local snapshot is captured
+  and `atelet` uploads it in the background. Suspending an Actor that is already
+  suspended returns it as it is.
 
-- **Pause**: a short-term checkpoint of a running Actor. Snapshot files remain
-  on the node VM, and the following Resume is prioritized onto the node VM
-  where the snapshots are persisted.
-
-- **Resume**: activate a suspended/paused Actor by restoring it onto a Worker. The
+- **Resume**: activate a suspended Actor by restoring it onto a Worker. The
   common path restores from a snapshot rather than cold-booting.
 
 ## Volumes
 
 - **DurableDir volume**: a directory mounted into one or more containers
-  whose contents are preserved by the [`Data` snapshot scope](#snapshots)
+  whose contents are preserved by the [`VOLUMES` snapshot fidelity](#snapshots)
   and therefore survive across Suspend/Resume independently of process
   memory or other rootfs writes. A volume may be mounted into multiple
   containers, potentially at different paths. This is the per-Actor
   application-data surface.
 
-  How many an `ActorTemplate` may declare depends on its `sandboxClass`:
-  a `microvm` template may declare several (they are subdirectories of one
-  virtio-fs share, so they cost nothing extra per volume), while a `gvisor`
-  template is limited to one until gVisor can accept more than a single
-  durable mount.
+  An `ActorTemplate` may declare several, on either sandbox class.
 
 ## Snapshots
 
-- **Snapshot scope**: what an `ActorTemplate`'s `SnapshotConfig` includes
-  in a given snapshot. Two scopes exist today:
-  - **`Full`**: process memory plus the rootfs delta on top of the OCI
-    image, and any attached `DurableDir` volumes. Used to capture
-    everything needed to resume hot.
-  - **`Data`**: only the contents of attached volumes that support
-    snapshots — currently `DurableDir` volumes. Process memory and the
-    rest of rootfs are discarded. Used to persist application data
-    cheaply without the cost of a full memory image. On Resume the
-    containers start afresh from the OCI image with the `DurableDir`
-    contents restored.
+- **Snapshot fidelity**: the state layers a snapshot holds, ordered lowest
+  to highest; each level includes the ones below it.
+  - **`VOLUMES`**: only the contents of attached volumes that support
+    snapshots — currently `DurableDir` volumes. Process memory and rootfs
+    changes are discarded. Used to persist application data cheaply
+    without the cost of a memory image. On Resume the containers start
+    afresh from the OCI image with the `DurableDir` contents restored.
+  - **`ROOTFS`**: volumes plus the root filesystem changes made since boot.
+    Process memory is discarded; on Resume the containers cold-boot from the
+    OCI image with their rootfs writes back in place.
+  - **`MEMORY`**: volumes, rootfs changes, and process memory. Used to
+    capture everything needed to resume hot.
 
-  Scopes describe only what a snapshot *captures*. They are configured
-  per-trigger via `onPause` and `onCommit`: `onPause` selects what is
-  captured during a [Pause](#lifecycle) (kept on the node), and
-  `onCommit` selects what is captured during a [Suspend](#lifecycle)
-  (uploaded to snapshot storage). `onCommit` must be a subset of
-  `onPause`.
+  Fidelity describes only what a snapshot *holds*. A template sets one
+  level, `preferredFidelity`, the ceiling for every snapshot of its actors:
+  both the node-local checkpoint a [Suspend](#lifecycle) keeps on the node and
+  the snapshot uploaded to snapshot storage. It is best
+  effort: the system never packages more than that level, and may package
+  less when a layer cannot be captured or is too expensive to capture at
+  the time. A process resumed in place keeps its memory regardless.
 
-- **Golden Snapshot**: the initial checkpoint captured once, when an
+- **Golden Snapshot**: the initial checkpoint normally captured once, when an
   `ActorTemplate` is created, from a temporary "golden" boot of the workload.
-  By default an Actor of that template is first restored from this shared
-  snapshot. It is always a `Full` capture.
+  Templates with golden snapshot creation disabled do not create one. By
+  default an Actor of that template is first restored from this shared
+  snapshot when it is available; otherwise it cold-boots. It is always a
+  `MEMORY` capture.
 
 - **Last Snapshot**: the most recent per-Actor snapshot, written on Suspend and
   used to restore that specific Actor on the next Resume.

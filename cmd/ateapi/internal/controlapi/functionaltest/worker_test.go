@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/go-cmp/cmp"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/testing/protocmp"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -33,7 +33,7 @@ const testWorkerName = "5f2c1a90-7b34-4e6d-8a11-0c3e9d5b7f42"
 // newTestWorker returns a Worker in the shape CreateWorker accepts: named after
 // its pod UID, with the pod coordinates filled in and no status. Status is
 // output-only, and that includes capacity — a Worker gets that from its own
-// ateom's report to WorkerService, not from whoever registered it. These tests
+// worker's report to WorkerService, not from whoever registered it. These tests
 // never place an actor, so the unreported default is enough.
 //
 // The Worker stands on its own, with no pod behind it. That is enough for the
@@ -48,8 +48,6 @@ func newTestWorker(ns string) *ateapipb.Worker {
 		WorkerPod:       "worker-api-1",
 		WorkerPodUid:    testWorkerName,
 		NodeName:        "node1",
-		Ips:             []string{"10.1.2.3"},
-		SandboxClass:    "gvisor",
 	}
 }
 
@@ -94,7 +92,8 @@ func containsWorker(workers []*ateapipb.Worker, name string) bool {
 }
 
 // TestCreateAndGetWorker registers a Worker and reads it back, checking that
-// the server assigns the metadata and the ACTIVE status a new Worker starts in.
+// the server assigns the metadata and the UNAVAILABLE status a new Worker
+// starts in.
 func TestCreateAndGetWorker(t *testing.T) {
 	ns := namespaceForTest("ns-worker-create-get")
 	tc := setupTest(t, ns)
@@ -104,7 +103,7 @@ func TestCreateAndGetWorker(t *testing.T) {
 
 	want := newTestWorker(ns)
 	want.Metadata.Version = 1
-	want.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_ACTIVE}
+	want.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE}
 	if diff := cmp.Diff(want, created, protocmp.Transform(), ignoreServerMetadata); diff != "" {
 		t.Errorf("CreateWorker response mismatch (-want +got):\n%s", diff)
 	}
@@ -126,7 +125,7 @@ func TestCreateAndGetWorker(t *testing.T) {
 //  1. Creates a mock WorkerPool in Kubernetes.
 //  2. Creates a mock worker Pod in Kubernetes belonging to that pool, registers
 //     the Worker the syncer would derive from it, and reports the capacity its
-//     ateom would.
+//     worker would.
 //  3. Calls ListWorkers RPC.
 //  4. Verifies that the worker appears in the response.
 func TestListWorkers(t *testing.T) {
@@ -153,18 +152,23 @@ func TestListWorkers(t *testing.T) {
 		{
 			Metadata: &ateapipb.ResourceMetadata{
 				Name: podUID,
-				// Two writes: the registration, then the capacity report.
-				Version: 2,
+				// Three writes: the registration, marking it available, then
+				// the capacity report.
+				Version: 3,
 			},
 			WorkerNamespace: ns,
 			WorkerPool:      "pool1",
 			WorkerPod:       "worker-1",
 			WorkerPodUid:    podUID,
 			NodeName:        "node1",
-			Ips:             []string{"127.0.0.1"},
-			SandboxClass:    "gvisor",
 			Labels:          map[string]string{"foo": "bar"},
-			Status:          &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_ACTIVE, Capacity: &ateapipb.WorkerResources{Actors: 1}},
+			Status: &ateapipb.WorkerStatus{
+				State:           ateapipb.WorkerState_WORKER_STATE_ACTIVE,
+				RegisteredEpoch: reportedEpoch,
+				Ips:             []string{"127.0.0.1"},
+				Capacity:        &ateapipb.WorkerResources{Actors: 1, CpuMillicores: 1000, MemoryBytes: 512 << 20},
+				SandboxClasses:  workerSandboxClasses(defaultWorkerRuntime("gvisor")),
+			},
 		},
 	}
 
@@ -241,7 +245,7 @@ func TestUpdateWorker(t *testing.T) {
 	want := newTestWorker(ns)
 	want.Metadata.Version = 2
 	want.Labels = map[string]string{"tier": "batch"}
-	want.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_ACTIVE}
+	want.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE}
 	if diff := cmp.Diff(want, updated, protocmp.Transform(), ignoreServerMetadata); diff != "" {
 		t.Errorf("UpdateWorker response mismatch (-want +got):\n%s", diff)
 	}
@@ -256,16 +260,17 @@ func TestDrainWorker(t *testing.T) {
 	defer tc.cleanup()
 
 	registerWorker(t, tc, ns)
-	waitForWorkerAvailable(t, tc, testWorkerName)
+	waitForWorkerState(t, tc, testWorkerName, ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE)
 
 	drained, err := tc.client.DrainWorker(context.Background(), &ateapipb.DrainWorkerRequest{Worker: workerRef(testWorkerName)})
 	if err != nil {
 		t.Fatalf("DrainWorker failed: %v", err)
 	}
 
-	want := newTestWorker(ns)
-	want.Metadata.Version = 2
-	want.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_DRAINING}
+	wantWorker := newTestWorker(ns)
+	wantWorker.Metadata.Version = 2
+	wantWorker.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_DRAINING}
+	want := &ateapipb.DrainWorkerResponse{Worker: wantWorker}
 	if diff := cmp.Diff(want, drained, protocmp.Transform(), ignoreServerMetadata); diff != "" {
 		t.Errorf("DrainWorker response mismatch (-want +got):\n%s", diff)
 	}
@@ -273,10 +278,45 @@ func TestDrainWorker(t *testing.T) {
 	waitForWorkerState(t, tc, testWorkerName, ateapipb.WorkerState_WORKER_STATE_DRAINING)
 }
 
+// TestMarkWorkerAvailability moves a Worker between ACTIVE and UNAVAILABLE, and
+// checks each state reaches the worker cache the scheduler places actors from.
+func TestMarkWorkerAvailability(t *testing.T) {
+	ns := namespaceForTest("ns-worker-availability")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+	ctx := context.Background()
+
+	registerWorker(t, tc, ns)
+	waitForWorkerState(t, tc, testWorkerName, ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE)
+
+	available, err := tc.client.MarkWorkerAvailable(ctx, &ateapipb.MarkWorkerAvailableRequest{Worker: workerRef(testWorkerName)})
+	if err != nil {
+		t.Fatalf("MarkWorkerAvailable failed: %v", err)
+	}
+	want := newTestWorker(ns)
+	want.Metadata.Version = 2
+	want.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_ACTIVE}
+	if diff := cmp.Diff(want, available.GetWorker(), protocmp.Transform(), ignoreServerMetadata); diff != "" {
+		t.Errorf("MarkWorkerAvailable response mismatch (-want +got):\n%s", diff)
+	}
+	waitForWorkerState(t, tc, testWorkerName, ateapipb.WorkerState_WORKER_STATE_ACTIVE)
+
+	unavailable, err := tc.client.MarkWorkerUnavailable(ctx, &ateapipb.MarkWorkerUnavailableRequest{Worker: workerRef(testWorkerName)})
+	if err != nil {
+		t.Fatalf("MarkWorkerUnavailable failed: %v", err)
+	}
+	want.Metadata.Version = 3
+	want.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE}
+	if diff := cmp.Diff(want, unavailable.GetWorker(), protocmp.Transform(), ignoreServerMetadata); diff != "" {
+		t.Errorf("MarkWorkerUnavailable response mismatch (-want +got):\n%s", diff)
+	}
+	waitForWorkerState(t, tc, testWorkerName, ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE)
+}
+
 // TestDeleteWorker deregisters a Worker and checks it is gone. The delete
-// drains the Worker on its way out, so the record it returns is that one rather
-// than the one Create stored. Deregistering is not silently idempotent, so a
-// second attempt reports NOT_FOUND.
+// marks and drains the Worker in one write on its way out, so the record it
+// returns is one write past the one Create stored. Deregistering is not
+// silently idempotent, so a second attempt reports NOT_FOUND.
 func TestDeleteWorker(t *testing.T) {
 	ns := namespaceForTest("ns-worker-delete")
 	tc := setupTest(t, ns)
@@ -294,6 +334,9 @@ func TestDeleteWorker(t *testing.T) {
 	want.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_DRAINING}
 	if diff := cmp.Diff(want, deleted, protocmp.Transform(), ignoreServerMetadata); diff != "" {
 		t.Errorf("DeleteWorker response mismatch (-want +got):\n%s", diff)
+	}
+	if deleted.GetMetadata().GetDeleteTime() == nil {
+		t.Error("DeleteWorker returned a worker without delete_time")
 	}
 
 	listed, err := tc.client.ListWorkers(ctx, &ateapipb.ListWorkersRequest{})
@@ -314,12 +357,12 @@ func TestValidation_Worker(t *testing.T) {
 	defer tc.cleanup()
 
 	t.Run("ListWorkers", func(t *testing.T) {
-		_, err := tc.client.ListWorkers(context.Background(), &ateapipb.ListWorkersRequest{PageSize: -1})
+		_, err := tc.client.ListWorkers(context.Background(), &ateapipb.ListWorkersRequest{Options: &ateapipb.ListOptions{PageSize: -1}})
 		assertGrpcErrorRegex(t, err, codes.InvalidArgument, "page_size: Invalid value")
 	})
 
 	t.Run("ListWorkers invalid token", func(t *testing.T) {
-		_, err := tc.client.ListWorkers(context.Background(), &ateapipb.ListWorkersRequest{PageToken: "%%%"})
+		_, err := tc.client.ListWorkers(context.Background(), &ateapipb.ListWorkersRequest{Options: &ateapipb.ListOptions{PageToken: "%%%"}})
 		assertGrpcError(t, err, codes.InvalidArgument, "invalid page_token")
 	})
 }

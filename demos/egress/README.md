@@ -11,7 +11,7 @@ intercepted and carried over mTLS to a gateway that verifies who is making the r
 ## What it demonstrates
 
 ```text
-  ┌──────────────── ateom worker pod ─────────────────┐
+  ┌─────────────────── worker pod ────────────────────┐
   │  Actor (gVisor)                                     │
   │  GET http://<dst-ip>:80/   (plain HTTP)             │
   │        │                                            │
@@ -48,8 +48,8 @@ intercepted and carried over mTLS to a gateway that verifies who is making the r
   `EgressPolicy`. A request the gateway can read (cleartext HTTP, or TLS it terminates) is
   decided per request: the rules in order, over its `Host` and the address the Actor dialed,
   first match wins, and the request is sent to what that rule checked. TLS to a name no `https`
-  rule covers is closed at the ClientHello (`tls_passthrough` rules are not supported yet). An
-  Actor with no policy gets no tunnel at all.
+  rule covers is allowed only by a matching `tls_passthrough` rule. An Actor with no policy
+  gets no tunnel at all.
 
 ## Choose a dataplane
 
@@ -58,10 +58,10 @@ ActorTemplate, worker pool, test, and manual walkthrough are otherwise the same.
 
 ```bash
 # Envoy (default)
-./hack/install-ate-kind.sh --deploy-ate-system
+./hack/install-ate-kind.sh --deploy-ate-system --credential-provider='{"name":"k8s.io"}'
 
 # agentgateway
-./hack/install-ate-kind.sh --deploy-ate-system --atenet-dataplane=agentgateway
+./hack/install-ate-kind.sh --deploy-ate-system --atenet-dataplane=agentgateway --credential-provider='{"name":"k8s.io"}'
 ```
 
 | | Envoy | agentgateway |
@@ -77,8 +77,10 @@ rejects that option with agentgateway rather than silently omitting it.
 
 ## Components
 
-- **Egress app (`main.go`)** — the Actor: `POST /` with `{"url":"..."}` → fetches it → returns
-  status + body. It also serves `POST /grpc`, described below.
+- **Egress app (`main.go`)** — the Actor: `POST /` fetches an HTTP(S) URL and returns the status,
+  body, and observed protocol. `POST /websocket` probes a `ws` or `wss` origin; `POST /grpc` makes
+  unary and streaming gRPC calls, described below; `POST /connect` sends a forward proxy an HTTP
+  CONNECT, in the clear or over TLS, and returns its answer.
 - **Egress gateway** — the `atenet-egress` Deployment. Envoy uses a co-located atenet `ext_proc`
   container started with `--mode=egress`; agentgateway uses its built-in `substrateEgress` policy
   and does not need that sidecar. The installer renders the matching configuration and container.
@@ -103,7 +105,7 @@ rejects that option with agentgateway rather than silently omitting it.
 ## Deploy the demo fixture
 
 ```bash
-./hack/install-ate.sh --deploy-demo-egress
+go run ./cmd/ate-setup deploy demo egress
 ```
 
 The install applies the worker pool, creates the `ate-demo-egress` atespace and
@@ -131,6 +133,14 @@ then asserts:
   refused before any CONNECT is answered.
 
 Add `--cleanup` to remove everything the script created.
+
+### HTTPS and WebSocket E2E tests
+
+Both supported egress dataplanes intercept HTTPS policy traffic. The Actor
+trusts the gateway through its projected CA bundle; the gateway verifies each
+local test origin against the service-DNS CA. The [egress protocol test
+runbook](../../docs/dev/mitm-egress-test-runbook.md) sets up this trust on Kind
+and runs the HTTP, HTTPS, WebSocket, and delayed-restore tests.
 
 ## Manual walkthrough
 
@@ -243,5 +253,5 @@ from the cluster, works for a manual run.
 
 ```bash
 ./demos/egress/test-egress.sh --cleanup
-./hack/install-ate.sh --delete-demo-egress
+go run ./cmd/ate-setup delete demo egress
 ```

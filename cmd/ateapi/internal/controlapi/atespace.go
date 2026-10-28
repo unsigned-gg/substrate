@@ -19,13 +19,12 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/apivalidation"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/defaults"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
+	"go.ate.dev/substrate/cmd/ateapi/internal/defaults"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 )
 
 func (s *RPCService) CreateAtespace(ctx context.Context, req *ateapipb.CreateAtespaceRequest) (*ateapipb.Atespace, error) {
@@ -40,7 +39,7 @@ func (s *RPCService) CreateAtespace(ctx context.Context, req *ateapipb.CreateAte
 
 	// Validate the request, including the object within it.
 	if errs := apivalidation.ValidateCreateAtespaceRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 
 	// Handle the creation, including validation of the final stored object.
@@ -54,7 +53,7 @@ func (s *ServiceImpl) CreateAtespace(ctx context.Context, inAtespace *ateapipb.A
 	stored, err := s.store.CreateAtespace(ctx, inAtespace)
 	if err != nil {
 		if errors.Is(err, store.ErrAlreadyExists) {
-			return nil, status.Errorf(codes.AlreadyExists, "Atespace %s already exists", inAtespace.Metadata.Name)
+			return nil, apierror.AlreadyExists("Atespace %s already exists", inAtespace.Metadata.Name)
 		}
 		return nil, fmt.Errorf("while recording atespace: %w", err)
 	}
@@ -64,7 +63,7 @@ func (s *ServiceImpl) CreateAtespace(ctx context.Context, inAtespace *ateapipb.A
 
 func (s *RPCService) GetAtespace(ctx context.Context, req *ateapipb.GetAtespaceRequest) (*ateapipb.Atespace, error) {
 	if errs := apivalidation.ValidateGetAtespaceRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 
 	return s.impl.GetAtespace(ctx, req.Atespace.Name)
@@ -73,7 +72,7 @@ func (s *RPCService) GetAtespace(ctx context.Context, req *ateapipb.GetAtespaceR
 func (s *ServiceImpl) GetAtespace(ctx context.Context, name string) (*ateapipb.Atespace, error) {
 	atespace, err := s.store.GetAtespace(ctx, name)
 	if errors.Is(err, store.ErrNotFound) {
-		return nil, status.Errorf(codes.NotFound, "Atespace %s not found", name)
+		return nil, apierror.NotFound("Atespace %s not found", name)
 	} else if err != nil {
 		return nil, fmt.Errorf("while getting atespace from DB: %w", err)
 	}
@@ -83,10 +82,10 @@ func (s *ServiceImpl) GetAtespace(ctx context.Context, name string) (*ateapipb.A
 
 func (s *RPCService) ListAtespaces(ctx context.Context, req *ateapipb.ListAtespacesRequest) (*ateapipb.ListAtespacesResponse, error) {
 	if errs := apivalidation.ValidateListAtespacesRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 
-	page, err := s.impl.ListAtespaces(ctx, store.ListOptions{PageSize: req.PageSize, PageToken: req.PageToken})
+	page, err := s.impl.ListAtespaces(ctx, toStoreListOptions(req.GetOptions()))
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +96,6 @@ func (s *RPCService) ListAtespaces(ctx context.Context, req *ateapipb.ListAtespa
 }
 
 func (s *ServiceImpl) ListAtespaces(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapipb.Atespace], error) {
-	opts.PageSize = effectivePageSize(opts.PageSize)
 	page, err := s.store.ListAtespaces(ctx, opts)
 	if err != nil {
 		return page, mapListError(fmt.Errorf("while listing atespaces in db: %w", err))
@@ -107,7 +105,7 @@ func (s *ServiceImpl) ListAtespaces(ctx context.Context, opts store.ListOptions)
 
 func (s *RPCService) DeleteAtespace(ctx context.Context, req *ateapipb.DeleteAtespaceRequest) (*ateapipb.Atespace, error) {
 	if errs := apivalidation.ValidateDeleteAtespaceRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 
 	return s.impl.DeleteAtespace(ctx, req.Atespace.Name, toDeletePreconditions(req.GetOptions()))
@@ -117,16 +115,16 @@ func (s *ServiceImpl) DeleteAtespace(ctx context.Context, name string, precondit
 	deleted, err := s.store.DeleteAtespace(ctx, name, precondition)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "Atespace %s not found", name)
+			return nil, apierror.NotFound("Atespace %s not found", name)
 		}
 		if errors.Is(err, store.ErrFailedPrecondition) {
-			return nil, status.Errorf(codes.FailedPrecondition, "Atespace %s is not empty", name)
+			return nil, apierror.FailedPrecondition("Atespace %s is not empty", name)
 		}
 		if errors.Is(err, store.ErrUIDConflict) {
-			return nil, status.Errorf(codes.Aborted, "Atespace %s does not have uid %s", name, precondition.UID)
+			return nil, apierror.Aborted("Atespace %s does not have uid %s", name, precondition.UID)
 		}
 		if errors.Is(err, store.ErrVersionConflict) {
-			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+			return nil, apierror.Aborted("concurrent update conflict, please retry")
 		}
 		return nil, fmt.Errorf("while deleting atespace from DB: %w", err)
 	}

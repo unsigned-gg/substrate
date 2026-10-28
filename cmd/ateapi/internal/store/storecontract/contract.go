@@ -35,9 +35,9 @@ import (
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 )
 
 // testAtespace is the atespace used by tests that create a single actor.
@@ -77,7 +77,7 @@ const (
 var (
 	ignoreUID        = protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "uid")
 	ignoreVersion    = protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "version")
-	ignoreTimestamps = protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "create_time", "update_time")
+	ignoreTimestamps = protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "create_time", "update_time", "delete_time")
 )
 
 func newTestAtespace(name string) *ateapipb.Atespace {
@@ -116,6 +116,12 @@ func newTestActorTemplate(atespace, name string) *ateapipb.ActorTemplate {
 				},
 			},
 		}},
+		// Fully defaulted, as the RPC layer stores it, so a read that
+		// backfills defaults returns what was created.
+		SnapshotConfig: &ateapipb.SnapshotConfig{
+			PreferredFidelity:    ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			GoldenSnapshotConfig: &ateapipb.GoldenSnapshotConfig{Mode: ateapipb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_ENABLED},
+		},
 	}
 }
 
@@ -129,7 +135,7 @@ func newTestWorker(name, pod string) *ateapipb.Worker {
 		WorkerPod:       pod,
 		WorkerPodUid:    testWorkerPodUID,
 		Status: &ateapipb.WorkerStatus{
-			Capacity: &ateapipb.WorkerResources{Resources: resources.CPUMemory(2000, 4<<30)},
+			Capacity: &ateapipb.WorkerResources{CpuMillicores: 2000, MemoryBytes: 4 << 30},
 		},
 	}
 }
@@ -195,6 +201,129 @@ func assertPruned(t *testing.T, op string, want, got proto.Message) {
 	}
 }
 
+// resourceMessage is a stored resource, which carries ResourceMetadata.
+type resourceMessage interface {
+	proto.Message
+	GetMetadata() *ateapipb.ResourceMetadata
+}
+
+// markForDeletionCase binds one resource's store methods for
+// testMarkForDeletion. R is the key the methods take.
+type markForDeletionCase[R any, T resourceMessage] struct {
+	ref    R
+	input  T
+	create func(context.Context, T) (T, error)
+	get    func(context.Context, R) (T, error)
+	update func(context.Context, R, store.Precondition, func(T) error) (T, error)
+	mark   func(context.Context, R, store.DeletePreconditions, func(T) error) (T, error)
+	// mutate, if set, is passed to the first mark, and mutated reports whether
+	// it landed in the same write.
+	mutate  func(T) error
+	mutated func(T) bool
+}
+
+// testMarkForDeletion checks the Mark<Resource>ForDeletion contract. Only a
+// mark sets delete_time, and no update clears it. A mark checks its guards,
+// writes nothing when mutate refuses, and keeps the first stamp when repeated.
+func testMarkForDeletion[R any, T resourceMessage](t *testing.T, c markForDeletionCase[R, T]) {
+	t.Helper()
+	ctx := context.Background()
+	c.input.GetMetadata().DeleteTime = timestamppb.Now()
+	created, err := c.create(ctx, c.input)
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	if created.GetMetadata().GetDeleteTime() != nil {
+		t.Fatalf("a new resource carries delete_time %v", created.GetMetadata().GetDeleteTime())
+	}
+
+	// A plain update cannot set it.
+	smuggled, err := c.update(ctx, c.ref, store.PreconditionFrom(created), func(toUpdate T) error {
+		toUpdate.GetMetadata().DeleteTime = timestamppb.Now()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	if smuggled.GetMetadata().GetDeleteTime() != nil {
+		t.Errorf("a plain update set delete_time to %v, want it ignored", smuggled.GetMetadata().GetDeleteTime())
+	}
+
+	if _, err := c.mark(ctx, c.ref, store.DeletePreconditions{UID: "other-uid"}, nil); !errors.Is(err, store.ErrUIDConflict) {
+		t.Errorf("mark with a foreign uid = %v, want ErrUIDConflict", err)
+	}
+	if _, err := c.mark(ctx, c.ref, store.DeletePreconditions{Version: created.GetMetadata().GetVersion()}, nil); !errors.Is(err, store.ErrVersionConflict) {
+		t.Errorf("mark with a stale version = %v, want ErrVersionConflict", err)
+	}
+
+	// mutate's refusal writes nothing, so nothing is stamped.
+	refused := errors.New("refused")
+	if _, err := c.mark(ctx, c.ref, store.DeletePreconditions{}, func(T) error { return refused }); !errors.Is(err, refused) {
+		t.Errorf("mark with a refusing mutate = %v, want it verbatim", err)
+	}
+	unmarked, err := c.get(ctx, c.ref)
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if unmarked.GetMetadata().GetDeleteTime() != nil || unmarked.GetMetadata().GetVersion() != smuggled.GetMetadata().GetVersion() {
+		t.Errorf("a refused mark wrote: delete_time %v, version %d, want unset and %d", unmarked.GetMetadata().GetDeleteTime(), unmarked.GetMetadata().GetVersion(), smuggled.GetMetadata().GetVersion())
+	}
+
+	// Unguarded, so the version having moved since created was read is fine.
+	marked, err := c.mark(ctx, c.ref, store.DeletePreconditions{}, c.mutate)
+	if err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if c.mutated != nil && !c.mutated(marked) {
+		t.Errorf("mark returned %v, want mutate's change in the same write", marked)
+	}
+	if marked.GetMetadata().GetDeleteTime() == nil {
+		t.Fatal("mark left delete_time unset")
+	}
+	if !marked.GetMetadata().GetDeleteTime().AsTime().Equal(marked.GetMetadata().GetUpdateTime().AsTime()) {
+		t.Errorf("delete_time = %v, want the write's update_time %v", marked.GetMetadata().GetDeleteTime().AsTime(), marked.GetMetadata().GetUpdateTime().AsTime())
+	}
+	if got, want := marked.GetMetadata().GetVersion(), smuggled.GetMetadata().GetVersion()+1; got != want {
+		t.Errorf("version = %d, want %d", got, want)
+	}
+	stored, err := c.get(ctx, c.ref)
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if diff := cmp.Diff(marked, stored, protocmp.Transform()); diff != "" {
+		t.Errorf("stored resource mismatch (-marked +stored):\n%s", diff)
+	}
+
+	// A plain update cannot clear it.
+	cleared, err := c.update(ctx, c.ref, store.PreconditionFrom(marked), func(toUpdate T) error {
+		toUpdate.GetMetadata().DeleteTime = nil
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	if !proto.Equal(cleared.GetMetadata().GetDeleteTime(), marked.GetMetadata().GetDeleteTime()) {
+		t.Errorf("a plain update changed delete_time to %v, want %v kept", cleared.GetMetadata().GetDeleteTime(), marked.GetMetadata().GetDeleteTime())
+	}
+
+	// The guards still bite after the mark: a version from before it is stale.
+	if _, err := c.mark(ctx, c.ref, store.DeletePreconditions{Version: smuggled.GetMetadata().GetVersion()}, nil); !errors.Is(err, store.ErrVersionConflict) {
+		t.Errorf("mark after the first with a stale version = %v, want ErrVersionConflict", err)
+	}
+
+	// A second mark writes but keeps the first stamp.
+	again, err := c.mark(ctx, c.ref, store.DeletePreconditions{UID: cleared.GetMetadata().GetUid()}, nil)
+	if err != nil {
+		t.Fatalf("second mark failed: %v", err)
+	}
+	if !proto.Equal(again.GetMetadata().GetDeleteTime(), marked.GetMetadata().GetDeleteTime()) {
+		t.Errorf("a second mark changed delete_time to %v, want %v kept", again.GetMetadata().GetDeleteTime(), marked.GetMetadata().GetDeleteTime())
+	}
+	if got, want := again.GetMetadata().GetVersion(), cleared.GetMetadata().GetVersion()+1; got != want {
+		t.Errorf("version after the second mark = %d, want %d", got, want)
+	}
+}
+
 // RunContractTests runs the backend-neutral store.Interface assertions
 // against a fresh store.Interface built by setup for each subtest. setup is
 // responsible for its own cleanup (e.g. via t.Cleanup).
@@ -232,7 +361,7 @@ func runEgressPolicyContractTests(t *testing.T, setup func(t *testing.T) store.I
 		policy := &ateapipb.EgressPolicy{
 			Metadata: &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "default"},
 			Rules: []*ateapipb.EgressRule{{
-				Http: &ateapipb.HTTPRule{Hostnames: []string{"api.example.com"}, Ports: &ateapipb.Ports{Numbers: []int32{80}}},
+				Http: &ateapipb.HttpRule{Hostnames: []string{"api.example.com"}, Ports: &ateapipb.Ports{Numbers: []int32{80}}},
 			}},
 		}
 
@@ -262,15 +391,21 @@ func runEgressPolicyContractTests(t *testing.T, setup func(t *testing.T) store.I
 		updated, err := s.UpdateEgressPolicy(ctx, actorRef, store.PreconditionFrom(created), func(policy *ateapipb.EgressPolicy) error {
 			policy.Metadata.Atespace = "other"
 			policy.Metadata.Name = "other"
-			policy.Rules = []*ateapipb.EgressRule{{TlsPassthrough: &ateapipb.TLSPassthroughRule{Hostnames: []string{"*"}, Ports: &ateapipb.Ports{Numbers: []int32{443}}}}}
+			policy.Rules = []*ateapipb.EgressRule{{TlsPassthrough: &ateapipb.TlsPassthroughRule{Hostnames: []string{"*"}, Ports: &ateapipb.Ports{Numbers: []int32{443}}}}}
 			return nil
 		})
 		if err != nil || updated.GetMetadata().GetAtespace() != testAtespace || updated.GetMetadata().GetName() != "default" || updated.GetMetadata().GetVersion() != 2 || updated.GetMetadata().GetUid() != created.GetMetadata().GetUid() {
 			t.Fatalf("UpdateEgressPolicy = %v, %v; want version 2", updated, err)
 		}
 		deleted, err := s.DeleteEgressPolicy(ctx, actorRef, store.DeletePreconditions{})
-		if err != nil || !proto.Equal(deleted, updated) {
-			t.Fatalf("DeleteEgressPolicy = %v, %v; want %v", deleted, err, updated)
+		if err != nil {
+			t.Fatalf("DeleteEgressPolicy failed: %v", err)
+		}
+		if diff := cmp.Diff(updated, deleted, protocmp.Transform(), protocmp.IgnoreFields(&ateapipb.ResourceMetadata{}, "delete_time")); diff != "" {
+			t.Fatalf("deleted policy mismatch (-updated +deleted):\n%s", diff)
+		}
+		if deleted.GetMetadata().GetDeleteTime() == nil {
+			t.Error("the deleted policy carries no delete_time")
 		}
 		if _, err := s.GetEgressPolicy(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("GetEgressPolicy after delete error = %v, want ErrNotFound", err)
@@ -741,15 +876,34 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 		}
 	})
 
+	t.Run("MarkActorForDeletion", func(t *testing.T) {
+		s := setup(t)
+		mustCreateAtespace(t, s, testAtespace)
+		testMarkForDeletion(t, markForDeletionCase[resources.ActorRef, *ateapipb.Actor]{
+			ref:    resources.ActorRef{Atespace: testAtespace, Name: "session-1"},
+			input:  newTestSuspendedActor(testAtespace, "session-1"),
+			create: s.CreateActor,
+			get:    s.GetActor,
+			update: s.UpdateActor,
+			mark:   s.MarkActorForDeletion,
+			mutate: func(toUpdate *ateapipb.Actor) error {
+				toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_DELETING
+				return nil
+			},
+			mutated: func(marked *ateapipb.Actor) bool {
+				return marked.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_DELETING
+			},
+		})
+	})
+
 	// The store does not gate the delete on state; the workflow does, and pins
-	// the row delete to the uid and version it last saw.
+	// the row delete to the uid it admitted.
 	t.Run("DeleteActor", func(t *testing.T) {
 		for _, state := range []ateapipb.ActorState{
 			ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
 			ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			ateapipb.ActorState_ACTOR_STATE_DELETING,
 			ateapipb.ActorState_ACTOR_STATE_RUNNING,
-			ateapipb.ActorState_ACTOR_STATE_PAUSED,
 		} {
 			t.Run(state.String(), func(t *testing.T) {
 				s := setup(t)
@@ -865,16 +1019,34 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 			Metadata:      &ateapipb.ResourceMetadata{Name: "id1", Atespace: testAtespace},
 			ActorTemplate: &ateapipb.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
 			Status: &ateapipb.ActorStatus{
-				State:            ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-				ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: testActorSnapshotURI("gs://bucket", testAtespace, "snapshot-1")},
+				State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+				LastAssignedGeneration: 1,
+				Snapshots: []*ateapipb.Snapshot{{
+					Generation: 1,
+					Owner:      ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+					Fidelity:   ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+					DurableSnapshot: &ateapipb.SnapshotStorage{
+						Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED,
+						Object: &ateapipb.ObjectSnapshot{SnapshotUri: testActorSnapshotURI("gs://bucket", testAtespace, "snapshot-1")},
+					},
+				}},
 			},
 		}
 		actor2 := &ateapipb.Actor{
 			Metadata:      &ateapipb.ResourceMetadata{Name: "id2", Atespace: testAtespace},
 			ActorTemplate: &ateapipb.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
 			Status: &ateapipb.ActorStatus{
-				State:            ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-				ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: testActorSnapshotURI("gs://bucket", testAtespace, "snapshot-2")},
+				State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+				LastAssignedGeneration: 1,
+				Snapshots: []*ateapipb.Snapshot{{
+					Generation: 1,
+					Owner:      ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+					Fidelity:   ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+					DurableSnapshot: &ateapipb.SnapshotStorage{
+						Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED,
+						Object: &ateapipb.ObjectSnapshot{SnapshotUri: testActorSnapshotURI("gs://bucket", testAtespace, "snapshot-2")},
+					},
+				}},
 			},
 		}
 		if _, err := s.CreateActor(ctx, actor1); err != nil {
@@ -1124,6 +1296,19 @@ func runActorTemplateContractTests(t *testing.T, setup func(t *testing.T) store.
 		}
 	})
 
+	t.Run("MarkActorTemplateForDeletion", func(t *testing.T) {
+		s := setup(t)
+		mustCreateAtespace(t, s, testAtespace)
+		testMarkForDeletion(t, markForDeletionCase[resources.ActorTemplateRef, *ateapipb.ActorTemplate]{
+			ref:    resources.ActorTemplateRef{Atespace: testAtespace, Name: "tmpl-a"},
+			input:  newTestActorTemplate(testAtespace, "tmpl-a"),
+			create: s.CreateActorTemplate,
+			get:    s.GetActorTemplate,
+			update: s.UpdateActorTemplate,
+			mark:   s.MarkActorTemplateForDeletion,
+		})
+	})
+
 	t.Run("ActorTemplateResources_BlockAtespaceDeletion", func(t *testing.T) {
 		s := setup(t)
 		ctx := context.Background()
@@ -1137,25 +1322,31 @@ func runActorTemplateContractTests(t *testing.T, setup func(t *testing.T) store.
 	})
 }
 
-// newTestSuspendedActor builds an actor that already holds an external
+// newTestSuspendedActor builds an actor that already holds a durable
 // snapshot, the state CreateTag tags from.
 func newTestSuspendedActor(atespace, name string) *ateapipb.Actor {
 	return &ateapipb.Actor{
 		Metadata:      &ateapipb.ResourceMetadata{Atespace: atespace, Name: name},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
 		Status: &ateapipb.ActorStatus{
-			State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-			ExternalSnapshot: &ateapipb.ExternalSnapshot{
-				SnapshotUri:  testActorSnapshotURI("gs://private", atespace, name),
-				ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
-			},
+			State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			LastAssignedGeneration: 1,
+			Snapshots: []*ateapipb.Snapshot{{
+				Generation: 1,
+				Owner:      ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+				Fidelity:   ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+				DurableSnapshot: &ateapipb.SnapshotStorage{
+					Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED,
+					Object: &ateapipb.ObjectSnapshot{SnapshotUri: testActorSnapshotURI("gs://private", atespace, name)},
+				},
+			}},
 		},
 	}
 }
 
 // newTestInProgressTag builds the row CreateTag reserves for a
-// tag of actor: ATESPACE-scoped, with no snapshot yet and the destination of
-// the copy still to come derived from status.storage_location and its UID.
+// tag of actor: ATESPACE-scoped, with a PENDING snapshot naming where the
+// copy is going.
 func newTestInProgressTag(name string, actor *ateapipb.Actor) *ateapipb.Tag {
 	atespace := actor.GetMetadata().GetAtespace()
 	return &ateapipb.Tag{
@@ -1163,7 +1354,17 @@ func newTestInProgressTag(name string, actor *ateapipb.Actor) *ateapipb.Tag {
 		Scope:    ateapipb.TagScope_TAG_SCOPE_ATESPACE,
 		Status: &ateapipb.TagStatus{
 			ActorTemplateUid: "template-uid",
-			StorageLocation:  "gs://private",
+			Snapshot: &ateapipb.Snapshot{
+				Generation: 1,
+				Owner:      ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG,
+				Fidelity:   ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+				DurableSnapshot: &ateapipb.SnapshotStorage{
+					Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING,
+					Object: &ateapipb.ObjectSnapshot{
+						SnapshotUri: testTagSnapshotURI("gs://private", atespace, name),
+					},
+				},
+			},
 		},
 	}
 }
@@ -1171,7 +1372,7 @@ func newTestInProgressTag(name string, actor *ateapipb.Actor) *ateapipb.Tag {
 func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
 	t.Helper()
 
-	// seedSuspendedActor seeds an atespace and an actor holding an external
+	// seedSuspendedActor seeds an atespace and an actor holding a durable
 	// snapshot, the precondition every tag test starts from.
 	seedSuspendedActor := func(t *testing.T, s store.Interface, atespace, name string) *ateapipb.Actor {
 		t.Helper()
@@ -1204,10 +1405,10 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 		if err != nil {
 			t.Fatalf("GetTag failed: %v", err)
 		}
-		// A reserved tag names where its copy is going and nothing else: it is
-		// not usable until the copy lands and finalize names it.
-		if tag.GetStatus().GetSnapshot() != nil {
-			t.Errorf("reserved tag snapshot = %v, want unset", tag.GetStatus().GetSnapshot())
+		// A reserved tag has a PENDING snapshot storage entry and is not
+		// usable until the copy lands and finalize marks it COMPLETED.
+		if got := tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetStatus(); got != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING {
+			t.Errorf("reserved tag snapshot storage status = %v, want PENDING", got)
 		}
 		if diff := cmp.Diff(inProgressTag, tag, protocmp.Transform(), ignoreUID, ignoreVersion, ignoreTimestamps); diff != "" {
 			t.Errorf("stored tag mismatch (-want +got):\n%s", diff)
@@ -1223,12 +1424,13 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 		if err != nil {
 			t.Fatalf("finalizing tag failed: %v", err)
 		}
-		wantURI := testTagSnapshotURI(tag.GetStatus().GetStorageLocation(), "team-a", tag.GetMetadata().GetUid())
-		if got := ready.GetStatus().GetSnapshot().GetSnapshotUri(); got != wantURI {
-			t.Errorf("finalized tag snapshot uri = %q, want %q", got, wantURI)
+		wantURI := testTagSnapshotURI("gs://private", "team-a", "production")
+		gotURI := ready.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri()
+		if gotURI != wantURI {
+			t.Errorf("finalized tag snapshot uri = %q, want %q", gotURI, wantURI)
 		}
-		if got := ready.GetStatus().GetStorageLocation(); got != tag.GetStatus().GetStorageLocation() {
-			t.Errorf("finalized tag storage location = %q, want unchanged", got)
+		if got := ready.GetStatus().GetSnapshot().GetDurableSnapshot().GetStatus(); got != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED {
+			t.Errorf("finalized tag snapshot storage status = %v, want COMPLETED", got)
 		}
 
 		updated, err := s.UpdateTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"}, store.PreconditionFrom(ready), func(toUpdate *ateapipb.Tag) error {
@@ -1332,13 +1534,13 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 			{
 				name: "snapshot uri",
 				mutate: func(toUpdate *ateapipb.Tag) {
-					toUpdate.Status.Snapshot.SnapshotUri = "gs://private/elsewhere"
+					toUpdate.Status.Snapshot.DurableSnapshot.Object.SnapshotUri = "gs://private/elsewhere"
 				},
 			},
 			{
 				name: "snapshot content scope",
 				mutate: func(toUpdate *ateapipb.Tag) {
-					toUpdate.Status.Snapshot.ContentScope = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA
+					toUpdate.Status.Snapshot.Fidelity = ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
 				},
 			},
 			{
@@ -1346,16 +1548,6 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 				mutate: func(toUpdate *ateapipb.Tag) {
 					toUpdate.Status.Snapshot = nil
 				},
-			},
-			{
-				name: "storage location",
-				mutate: func(toUpdate *ateapipb.Tag) {
-					toUpdate.Status.StorageLocation = "gs://elsewhere"
-				},
-			},
-			{
-				name:   "clearing the storage location",
-				mutate: func(toUpdate *ateapipb.Tag) { toUpdate.Status.StorageLocation = "" },
 			},
 			{
 				name:   "actor template uid",
@@ -1373,6 +1565,41 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 					t.Errorf("UpdateTag error = %v, want one matching store.ErrImmutableField", err)
 				}
 			})
+		}
+	})
+
+	t.Run("Tag_RecordSnapshotAfterReserve", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
+		tagRef := resources.TagRef{Atespace: "team-a", Name: "production"}
+
+		// A tag's snapshot is keyed on the UID the store assigns, so the tag
+		// is reserved without one and the snapshot is recorded by an update.
+		input := newTestInProgressTag(tagRef.Name, actor)
+		pending := input.Status.Snapshot
+		input.Status.Snapshot = nil
+		reserved, err := s.CreateTag(ctx, input)
+		if err != nil {
+			t.Fatalf("CreateTag without a snapshot failed: %v", err)
+		}
+		recorded, err := s.UpdateTag(ctx, tagRef, store.PreconditionFrom(reserved), func(toUpdate *ateapipb.Tag) error {
+			toUpdate.Status.Snapshot = proto.CloneOf(pending)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("recording the snapshot of a reserved tag failed: %v", err)
+		}
+		if diff := cmp.Diff(pending, recorded.GetStatus().GetSnapshot(), protocmp.Transform()); diff != "" {
+			t.Errorf("recorded snapshot mismatch (-want +got):\n%s", diff)
+		}
+
+		// Once recorded, the snapshot is fixed like any other.
+		if _, err := s.UpdateTag(ctx, tagRef, store.PreconditionFrom(recorded), func(toUpdate *ateapipb.Tag) error {
+			toUpdate.Status.Snapshot.DurableSnapshot.Object.SnapshotUri = "gs://private/elsewhere"
+			return nil
+		}); !errors.Is(err, store.ErrImmutableField) {
+			t.Errorf("rewriting a recorded snapshot = %v, want one matching store.ErrImmutableField", err)
 		}
 	})
 
@@ -1449,6 +1676,23 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 		}
 	})
 
+	t.Run("MarkTagForDeletion", func(t *testing.T) {
+		s := setup(t)
+		mustCreateAtespace(t, s, testAtespace)
+		actor, err := s.CreateActor(context.Background(), newTestSuspendedActor(testAtespace, "actor-1"))
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		testMarkForDeletion(t, markForDeletionCase[resources.TagRef, *ateapipb.Tag]{
+			ref:    resources.TagRef{Atespace: testAtespace, Name: "production"},
+			input:  newTestInProgressTag("production", actor),
+			create: s.CreateTag,
+			get:    s.GetTag,
+			update: s.UpdateTag,
+			mark:   s.MarkTagForDeletion,
+		})
+	})
+
 	t.Run("ListTags_PaginationAndScope", func(t *testing.T) {
 		s := setup(t)
 		ctx := context.Background()
@@ -1494,12 +1738,9 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 }
 
 // finalizeTag mutates a reserved tag the way the tag workflow's second
-// transaction does: it names the copy that landed under the tag UID.
+// transaction does: it marks the pending snapshot storage COMPLETED.
 func finalizeTag(toUpdate *ateapipb.Tag) error {
-	toUpdate.Status.Snapshot = &ateapipb.ExternalSnapshot{
-		SnapshotUri:  testTagSnapshotURI(toUpdate.GetStatus().GetStorageLocation(), toUpdate.GetMetadata().GetAtespace(), toUpdate.GetMetadata().GetUid()),
-		ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
-	}
+	toUpdate.Status.Snapshot.DurableSnapshot.Status = ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED
 	return nil
 }
 
@@ -1692,6 +1933,52 @@ func runWorkerContractTests(t *testing.T, setup func(t *testing.T) store.Interfa
 		}
 	})
 
+	t.Run("MarkWorkerForDeletion", func(t *testing.T) {
+		s := setup(t)
+		testMarkForDeletion(t, markForDeletionCase[string, *ateapipb.Worker]{
+			ref:    testWorkerName,
+			input:  newTestWorker(testWorkerName, "pod-1"),
+			create: s.CreateWorker,
+			get:    s.GetWorker,
+			update: s.UpdateWorker,
+			mark:   s.MarkWorkerForDeletion,
+			mutate: func(toUpdate *ateapipb.Worker) error {
+				toUpdate.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_DRAINING}
+				return nil
+			},
+			mutated: func(marked *ateapipb.Worker) bool {
+				return marked.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_DRAINING
+			},
+		})
+	})
+
+	// A mark publishes the marked worker like any other update.
+	t.Run("MarkWorkerForDeletion_Event", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		// Subscribed here so only the mark's event is on the channel.
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		defer watch.Close()
+
+		marked, err := s.MarkWorkerForDeletion(ctx, testWorkerName, store.DeletePreconditions{}, nil)
+		if err != nil {
+			t.Fatalf("mark failed: %v", err)
+		}
+		event := receiveEvent(t, watch.Events)
+		if event.Type != store.WorkerEventUpdated {
+			t.Errorf("expected WorkerEventUpdated, got %v", event.Type)
+		}
+		if diff := cmp.Diff(marked, event.Worker, protocmp.Transform()); diff != "" {
+			t.Errorf("mark event worker mismatch (-marked +event):\n%s", diff)
+		}
+	})
+
 	// A worker name is a pod UID, so a name is only reused when the same pod is
 	// re-registered. The store still hands out a fresh uid, and a guard naming
 	// the old one must not reach the new incarnation.
@@ -1820,13 +2107,13 @@ func runWorkerContractTests(t *testing.T, setup func(t *testing.T) store.Interfa
 				defer wg.Done()
 				// Claimants contend over the allocation total, which is what a
 				// claim actually moves on the Worker record now that the
-				// assignments themselves are separate records. CpuMilli carries
+				// assignments themselves are separate records. The cpu limit carries
 				// the claimant's number so the winner is identifiable.
 				_, err := s.UpdateWorker(ctx, testWorkerName, store.PreconditionFrom(created), func(toUpdate *ateapipb.Worker) error {
 					if toUpdate.GetStatus().GetAllocated().GetActors() > 0 {
 						return errTaken
 					}
-					toUpdate.Status.Allocated = &ateapipb.WorkerResources{Actors: 1, Resources: resources.CPUMemory(int64(i)+1, 0)}
+					toUpdate.Status.Allocated = &ateapipb.WorkerResources{Actors: 1, CpuMillicores: int64(i) + 1, MemoryBytes: 0}
 					return nil
 				})
 				switch {
@@ -2077,10 +2364,9 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 	// over several of them is unambiguous about which were counted.
 	newTestAssignment := func(actorUID string, cpuMilli, memoryBytes int64) *ateapipb.ActorAssignment {
 		return &ateapipb.ActorAssignment{
-			ActorTemplateRef: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "test-template"},
-			Actor:            &ateapipb.ObjectRef{Atespace: testAtespace, Name: "actor-" + actorUID},
-			ActorUid:         actorUID,
-			Resources:        resources.CPUMemory(cpuMilli, memoryBytes),
+			Actor:     &ateapipb.ObjectRef{Atespace: testAtespace, Name: "actor-" + actorUID},
+			ActorUid:  actorUID,
+			Resources: resources.CPUMemory(cpuMilli, memoryBytes),
 		}
 	}
 
@@ -2122,7 +2408,7 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 		if err != nil {
 			t.Fatalf("GetWorker failed: %v", err)
 		}
-		want := &ateapipb.WorkerResources{Actors: 1, Resources: resources.CPUMemory(500, 1<<20)}
+		want := &ateapipb.WorkerResources{Actors: 1, CpuMillicores: 500, MemoryBytes: 1 << 20}
 		if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
 			t.Errorf("allocated mismatch (-want +got):\n%s", diff)
 		}
@@ -2155,7 +2441,7 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 		if err != nil {
 			t.Fatalf("GetWorker failed: %v", err)
 		}
-		want := &ateapipb.WorkerResources{Actors: 1, Resources: resources.CPUMemory(250, 1<<21)}
+		want := &ateapipb.WorkerResources{Actors: 1, CpuMillicores: 250, MemoryBytes: 1 << 21}
 		if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
 			t.Errorf("allocated mismatch after rebinding the same actor (-want +got):\n%s", diff)
 		}
@@ -2270,7 +2556,7 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 		if err != nil {
 			t.Fatalf("GetWorker failed: %v", err)
 		}
-		want := &ateapipb.WorkerResources{Actors: 1, Resources: resources.CPUMemory(500, 0)}
+		want := &ateapipb.WorkerResources{Actors: 1, CpuMillicores: 500, MemoryBytes: 0}
 		if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
 			t.Errorf("a refused replacement changed the allocation (-want +got):\n%s", diff)
 		}
@@ -2357,7 +2643,7 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 		if err != nil {
 			t.Fatalf("GetWorker failed: %v", err)
 		}
-		want := &ateapipb.WorkerResources{Actors: 1, Resources: resources.CPUMemory(500, 1<<20)}
+		want := &ateapipb.WorkerResources{Actors: 1, CpuMillicores: 500, MemoryBytes: 1 << 20}
 		if diff := cmp.Diff(want, first.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
 			t.Errorf("first worker's allocation changed (-want +got):\n%s", diff)
 		}
@@ -2421,15 +2707,12 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 				t.Fatalf("ListWorkerAssignments(%s) failed: %v", name, err)
 			}
 			assignments := assignmentsPage.Items
-			want, err := resources.SumAllocated(assignments)
-			if err != nil {
-				t.Fatalf("%s: summing assignments: %v", name, err)
-			}
+			want := resources.SumAllocated(assignments)
 			// A Worker that never took anything has no allocation at all, while
 			// a sum over no assignments is a zeroed message; the two say the
 			// same thing, so compare what they mean rather than the messages.
 			got := worker.GetStatus().GetAllocated()
-			if got.GetActors() != want.GetActors() || !proto.Equal(got.GetResources(), want.GetResources()) {
+			if !sameAllocation(got, want) {
 				t.Errorf("%s: allocation %v disagrees with the %d assignments it holds (%v)",
 					name, got, len(assignments), want)
 			}
@@ -2463,7 +2746,7 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 		}
 		// The returned Worker is what the caller feeds the cache, so it has to
 		// be the post-release state, not the copy that went in.
-		wantReleased := &ateapipb.WorkerResources{Actors: 1, Resources: resources.CPUMemory(250, 1<<21)}
+		wantReleased := &ateapipb.WorkerResources{Actors: 1, CpuMillicores: 250, MemoryBytes: 1 << 21}
 		if diff := cmp.Diff(wantReleased, released.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
 			t.Errorf("returned worker's allocated mismatch (-want +got):\n%s", diff)
 		}
@@ -2479,7 +2762,7 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 		if err != nil {
 			t.Fatalf("GetWorker failed: %v", err)
 		}
-		want := &ateapipb.WorkerResources{Actors: 1, Resources: resources.CPUMemory(250, 1<<21)}
+		want := &ateapipb.WorkerResources{Actors: 1, CpuMillicores: 250, MemoryBytes: 1 << 21}
 		if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
 			t.Errorf("allocated mismatch after release (-want +got):\n%s", diff)
 		}
@@ -2704,10 +2987,7 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 				t.Fatalf("ListWorkerAssignments failed: %v", err)
 			}
 			assignments := assignmentsPage.Items
-			want, err := resources.SumAllocated(assignments)
-			if err != nil {
-				t.Fatalf("summing assignments: %v", err)
-			}
+			want := resources.SumAllocated(assignments)
 			if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
 				t.Fatalf("after step %d (actor %s) the total no longer matches the assignments (-want +got):\n%s", step, actorUID, diff)
 			}
@@ -2729,7 +3009,7 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 		if err != nil {
 			t.Fatalf("GetWorker failed: %v", err)
 		}
-		if got := worker.GetStatus().GetAllocated(); got.GetActors() != 0 || got.GetResources() != nil {
+		if got := worker.GetStatus().GetAllocated(); got.GetActors() != 0 || got.GetCpuMillicores() != 0 || got.GetMemoryBytes() != 0 {
 			t.Errorf("after releasing everything the total is %v, want all zero", got)
 		}
 	})
@@ -2878,6 +3158,9 @@ func runAtespaceContractTests(t *testing.T, setup func(t *testing.T) store.Inter
 		}
 		if got := deleted.GetMetadata().GetName(); got != "team-a" {
 			t.Errorf("deleted atespace name = %q, want team-a", got)
+		}
+		if deleted.GetMetadata().GetDeleteTime() == nil {
+			t.Error("the deleted atespace carries no delete_time")
 		}
 		if _, err := s.GetAtespace(ctx, "team-a"); !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("after delete, GetAtespace = %v, want ErrNotFound", err)
@@ -3169,7 +3452,7 @@ func runUnknownFieldContractTests(t *testing.T, setup func(t *testing.T) store.I
 		created, err := s.CreateEgressPolicy(ctx, ref, withUnknownField(&ateapipb.EgressPolicy{
 			Metadata: &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "default"},
 			Rules: []*ateapipb.EgressRule{withUnknownField(&ateapipb.EgressRule{
-				Http: &ateapipb.HTTPRule{Hostnames: []string{"api.example.com"}, Ports: &ateapipb.Ports{Numbers: []int32{80}}},
+				Http: &ateapipb.HttpRule{Hostnames: []string{"api.example.com"}, Ports: &ateapipb.Ports{Numbers: []int32{80}}},
 			})},
 		}))
 		if err != nil {
@@ -3364,4 +3647,10 @@ func runUnknownFieldContractTests(t *testing.T, setup func(t *testing.T) store.I
 		}
 		assertPruned(t, "DeleteWorker", created, deleted)
 	})
+}
+
+// sameAllocation compares two allocation totals by what they hold, so an
+// absent total and a zeroed one are the same.
+func sameAllocation(a, b *ateapipb.WorkerResources) bool {
+	return a.GetActors() == b.GetActors() && a.GetCpuMillicores() == b.GetCpuMillicores() && a.GetMemoryBytes() == b.GetMemoryBytes()
 }

@@ -26,27 +26,47 @@ import (
 // GetObject streams the object, fetching it as parallel byte ranges when it spans
 // more than one chunk (see rangedget.go). Smaller objects stay a single request.
 func (g *gcsClient) GetObject(ctx context.Context, bucket, object string) (io.ReadCloser, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	// The first chunk doubles as the size probe: a range read reports the whole
-	// object's size in its attrs, so nothing pays an extra round trip for it.
-	head, err := g.client.Bucket(bucket).Object(object).NewRangeReader(ctx, 0, downloadChunkSize)
+	// object's size in its attrs, so nothing pays an extra round trip for it. It
+	// goes out on a pooled client because for most snapshots it is the whole
+	// download, and a node restoring several at once must not queue them all on
+	// one connection.
+	head, err := g.nextClient().Bucket(bucket).Object(object).NewRangeReader(ctx, 0, downloadChunkSize)
 	if err != nil {
+		cancel()
 		if errors.Is(err, storage.ErrObjectNotExist) || errors.Is(err, storage.ErrBucketNotExist) {
 			return nil, fmt.Errorf("%w: Bucket:%q, Object:%q", ErrObjectNotFound, bucket, object)
 		}
 		return nil, err
 	}
+	reader := &gcsReader{Reader: head, cancel: cancel}
 	size := head.Attrs.Size
 	if size <= downloadChunkSize {
-		return head, nil
+		return reader, nil
 	}
-	return newRangedReader(ctx, size, head, g.fetchRange(bucket, object)), nil
+	return newRangedReader(ctx, size, reader, g.fetchRange(bucket, object)), nil
+}
+
+type gcsReader struct {
+	*storage.Reader
+	cancel context.CancelFunc
+}
+
+// ObjectSize implements SizedReader.
+func (r *gcsReader) ObjectSize() int64 { return r.Attrs.Size }
+
+func (r *gcsReader) Close() error {
+	// Cancel before closing so a blocked read cannot reopen the GCS request.
+	r.cancel()
+	return r.Reader.Close()
 }
 
 // fetchRange reads one range with a pooled client, so concurrent ranges do not all
 // multiplex onto the one HTTP/2 connection a single storage.Client holds.
 func (g *gcsClient) fetchRange(bucket, object string) fetchRangeFunc {
 	return func(ctx context.Context, i int, off, n int64, buf []byte) error {
-		rc, err := g.uploadClient(ctx, i).Bucket(bucket).Object(object).NewRangeReader(ctx, off, n)
+		rc, err := g.uploadClient(i).Bucket(bucket).Object(object).NewRangeReader(ctx, off, n)
 		if err != nil {
 			return fmt.Errorf("while opening range %d+%d of %q: %w", off, n, object, err)
 		}

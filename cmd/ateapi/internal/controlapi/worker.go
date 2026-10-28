@@ -19,13 +19,12 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/apivalidation"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/defaults"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
+	"go.ate.dev/substrate/cmd/ateapi/internal/defaults"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
@@ -35,7 +34,7 @@ import (
 // them and neither GetWorker nor ListWorkers grows with occupancy.
 func (s *RPCService) ListWorkerActorAssignments(ctx context.Context, req *ateapipb.ListWorkerActorAssignmentsRequest) (*ateapipb.ListWorkerActorAssignmentsResponse, error) {
 	if errs := apivalidation.ValidateListWorkerActorAssignmentsRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 	name := req.GetWorker().GetName()
 
@@ -44,13 +43,12 @@ func (s *RPCService) ListWorkerActorAssignments(ctx context.Context, req *ateapi
 	// Worker hosting nothing.
 	if _, err := s.impl.GetWorker(ctx, name); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "Worker %s not found", name)
+			return nil, apierror.NotFound("Worker %s not found", name)
 		}
 		return nil, fmt.Errorf("while fetching worker %s: %w", name, err)
 	}
 
-	page, err := s.impl.ListWorkerAssignments(ctx, name,
-		store.ListOptions{PageSize: effectivePageSize(req.GetPageSize()), PageToken: req.GetPageToken()})
+	page, err := s.impl.ListWorkerAssignments(ctx, name, toStoreListOptions(req.GetOptions()))
 	if err != nil {
 		return nil, mapListError(fmt.Errorf("while listing the assignments of worker %s: %w", name, err))
 	}
@@ -62,10 +60,10 @@ func (s *RPCService) ListWorkerActorAssignments(ctx context.Context, req *ateapi
 
 func (s *RPCService) ListWorkers(ctx context.Context, req *ateapipb.ListWorkersRequest) (*ateapipb.ListWorkersResponse, error) {
 	if errs := apivalidation.ValidateListWorkersRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 
-	page, err := s.impl.ListWorkers(ctx, store.ListOptions{PageSize: effectivePageSize(req.GetPageSize()), PageToken: req.GetPageToken()})
+	page, err := s.impl.ListWorkers(ctx, toStoreListOptions(req.GetOptions()))
 	if err != nil {
 		return nil, mapListError(fmt.Errorf("while listing workers in db: %w", err))
 	}
@@ -81,13 +79,13 @@ func (s *ServiceImpl) ListWorkers(ctx context.Context, opts store.ListOptions) (
 
 func (s *RPCService) GetWorker(ctx context.Context, req *ateapipb.GetWorkerRequest) (*ateapipb.Worker, error) {
 	if errs := apivalidation.ValidateGetWorkerRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 	name := req.GetWorker().GetName()
 
 	worker, err := s.impl.GetWorker(ctx, name)
 	if errors.Is(err, store.ErrNotFound) {
-		return nil, status.Errorf(codes.NotFound, "Worker %s not found", name)
+		return nil, apierror.NotFound("Worker %s not found", name)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("while getting worker: %w", err)
@@ -116,7 +114,7 @@ func (s *RPCService) CreateWorker(ctx context.Context, req *ateapipb.CreateWorke
 
 	// Validate the request, including the object within it.
 	if errs := apivalidation.ValidateCreateWorkerRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 
 	// Handle the creation, including validation of the final stored object.
@@ -124,30 +122,22 @@ func (s *RPCService) CreateWorker(ctx context.Context, req *ateapipb.CreateWorke
 }
 
 func (s *ServiceImpl) CreateWorker(ctx context.Context, inWorker *ateapipb.Worker) (*ateapipb.Worker, error) {
-	// A Worker is registered only once its pod is Ready and has an IP, which
-	// makes ACTIVE the only state it can be born in.
+	// A Worker takes no Actors until MarkWorkerAvailable.
 	outWorker := proto.CloneOf(inWorker)
-	// A new Worker hosts no Actors, so none are left from an earlier epoch.
 	outWorker.Status = &ateapipb.WorkerStatus{
-		State:         ateapipb.WorkerState_WORKER_STATE_ACTIVE,
-		ObservedEpoch: inWorker.GetEpoch(),
+		State: ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE,
 	}
-
-	// Capacity is left unset: a Worker holds nothing until its own ateom says
-	// what it has, through WorkerService.SetWorkerCapacity. Nothing is placed
-	// on it in the meantime, which is the point -- the alternative is guessing
-	// on the Worker's behalf and placing against the guess.
 
 	// Verify that the result is properly valid before storing it.
 	if errs := apivalidation.ValidateWorkerUpdate(ctx, field.NewPath("worker"), outWorker, inWorker, true); len(errs) > 0 {
-		return nil, toGRPCInternalError(errs)
+		return nil, resources.ToInternalError(errs)
 	}
 
 	// Save the data in the storage layer.
 	created, err := s.store.CreateWorker(ctx, outWorker)
 	if err != nil {
 		if errors.Is(err, store.ErrAlreadyExists) {
-			return nil, status.Errorf(codes.AlreadyExists, "Worker %s already exists", inWorker.GetMetadata().GetName())
+			return nil, apierror.AlreadyExists("Worker %s already exists", inWorker.GetMetadata().GetName())
 		}
 		return nil, fmt.Errorf("while creating worker: %w", err)
 	}
@@ -155,7 +145,7 @@ func (s *ServiceImpl) CreateWorker(ctx context.Context, inWorker *ateapipb.Worke
 }
 
 // UpdateWorker replaces the stored Worker with the one the request carries.
-// Only labels and epoch are the caller's to change; a request that alters an
+// Only labels are the caller's to change; a request that alters an
 // immutable field — including by leaving it unset, which would clear it — is
 // rejected.
 // The service layer enforces that with declarative validation against the
@@ -170,7 +160,7 @@ func (s *RPCService) UpdateWorker(ctx context.Context, req *ateapipb.UpdateWorke
 
 	// Validate the request.
 	if errs := apivalidation.ValidateUpdateWorkerRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 
 	return s.mutateWorker(ctx, inWorker.GetMetadata().GetName(), store.PreconditionFrom(inWorker), func(toUpdate *ateapipb.Worker) error {
@@ -202,14 +192,14 @@ func (s *ServiceImpl) UpdateWorker(ctx context.Context, name string, preconditio
 		// what enforces the immutable fields, since only the stored worker
 		// gives declarative validation an old value to compare against.
 		if errs := apivalidation.ValidateWorkerUpdate(ctx, field.NewPath("worker"), newVal, oldVal, false); len(errs) > 0 {
-			return resources.ToGRPCStatusError(errs)
+			return resources.ToAPIError(errs)
 		}
 
 		// Do any further work on the resource.
 
 		// Validate the final value before storing it.
 		if errs := apivalidation.ValidateWorkerUpdate(ctx, field.NewPath("worker"), newVal, oldVal, true); len(errs) > 0 {
-			return toGRPCInternalError(errs)
+			return resources.ToInternalError(errs)
 		}
 
 		return nil
@@ -241,36 +231,26 @@ func (s *ServiceImpl) FindWorkerHostingActor(ctx context.Context, actorUID strin
 
 func (s *RPCService) DeleteWorker(ctx context.Context, req *ateapipb.DeleteWorkerRequest) (*ateapipb.Worker, error) {
 	if errs := apivalidation.ValidateDeleteWorkerRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 	// The delete releases the Actor bound to this Worker before removing the
 	// record, so it is a workflow rather than a single store call.
 	return s.workerWorkflow.DeleteWorker(ctx, req.GetWorker().GetName(), toDeletePreconditions(req.GetOptions()))
 }
 
+func (s *ServiceImpl) MarkWorkerForDeletion(ctx context.Context, name string, precondition store.DeletePreconditions, mutate func(*ateapipb.Worker) error) (*ateapipb.Worker, error) {
+	return s.store.MarkWorkerForDeletion(ctx, name, precondition, mutate)
+}
+
 func (s *ServiceImpl) DeleteWorker(ctx context.Context, name string, precondition store.DeletePreconditions) (*ateapipb.Worker, error) {
 	return s.store.DeleteWorker(ctx, name, precondition)
 }
 
-func (s *RPCService) DrainWorker(ctx context.Context, req *ateapipb.DrainWorkerRequest) (*ateapipb.Worker, error) {
+func (s *RPCService) DrainWorker(ctx context.Context, req *ateapipb.DrainWorkerRequest) (*ateapipb.DrainWorkerResponse, error) {
 	if errs := apivalidation.ValidateDrainWorkerRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
-	name := req.GetWorker().GetName()
-
-	// A DrainWorkerRequest names a worker and carries no guards, so the ones
-	// the store requires come from a read here rather than from the client. A
-	// write that lands in between is reported as a conflict for the caller to
-	// retry, the same as any other guarded update.
-	observed, err := s.impl.GetWorker(ctx, name)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, status.Errorf(codes.NotFound, "Worker %s not found", name)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("while getting worker to drain: %w", err)
-	}
-
-	return s.mutateWorker(ctx, name, store.PreconditionFrom(observed), func(toUpdate *ateapipb.Worker) error {
+	drained, err := s.mutateNamedWorker(ctx, req.GetWorker().GetName(), func(toUpdate *ateapipb.Worker) error {
 		if toUpdate.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_DRAINING {
 			// already draining, do nothing
 			return &workerUnchanged{worker: proto.Clone(toUpdate).(*ateapipb.Worker)}
@@ -280,6 +260,70 @@ func (s *RPCService) DrainWorker(ctx context.Context, req *ateapipb.DrainWorkerR
 		// until something releases them. Draining only stops new placements.
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &ateapipb.DrainWorkerResponse{Worker: drained}, nil
+}
+
+func (s *RPCService) MarkWorkerAvailable(ctx context.Context, req *ateapipb.MarkWorkerAvailableRequest) (*ateapipb.MarkWorkerAvailableResponse, error) {
+	if errs := apivalidation.ValidateMarkWorkerAvailableRequest(ctx, req); len(errs) > 0 {
+		return nil, resources.ToAPIError(errs)
+	}
+	marked, err := s.mutateNamedWorker(ctx, req.GetWorker().GetName(), func(toUpdate *ateapipb.Worker) error {
+		switch toUpdate.GetStatus().GetState() {
+		case ateapipb.WorkerState_WORKER_STATE_ACTIVE:
+			return &workerUnchanged{worker: proto.Clone(toUpdate).(*ateapipb.Worker)}
+		case ateapipb.WorkerState_WORKER_STATE_DRAINING:
+			return errWorkerDraining
+		}
+		toUpdate.Status.State = ateapipb.WorkerState_WORKER_STATE_ACTIVE
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ateapipb.MarkWorkerAvailableResponse{Worker: marked}, nil
+}
+
+func (s *RPCService) MarkWorkerUnavailable(ctx context.Context, req *ateapipb.MarkWorkerUnavailableRequest) (*ateapipb.MarkWorkerUnavailableResponse, error) {
+	if errs := apivalidation.ValidateMarkWorkerUnavailableRequest(ctx, req); len(errs) > 0 {
+		return nil, resources.ToAPIError(errs)
+	}
+	marked, err := s.mutateNamedWorker(ctx, req.GetWorker().GetName(), func(toUpdate *ateapipb.Worker) error {
+		switch toUpdate.GetStatus().GetState() {
+		case ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE:
+			return &workerUnchanged{worker: proto.Clone(toUpdate).(*ateapipb.Worker)}
+		case ateapipb.WorkerState_WORKER_STATE_DRAINING:
+			return errWorkerDraining
+		}
+		toUpdate.Status.State = ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE
+		// The assignments are left alone, as for draining.
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ateapipb.MarkWorkerUnavailableResponse{Worker: marked}, nil
+}
+
+// errWorkerDraining refuses to move a draining Worker out of DRAINING, which
+// is final.
+var errWorkerDraining = errors.New("worker is draining")
+
+// mutateNamedWorker runs mutate against the named Worker for a request that
+// carries no guards, so the ones the store requires come from a read here
+// rather than from the client. A write that lands in between is reported as a
+// conflict for the caller to retry, the same as any other guarded update.
+func (s *RPCService) mutateNamedWorker(ctx context.Context, name string, mutate func(toUpdate *ateapipb.Worker) error) (*ateapipb.Worker, error) {
+	observed, err := s.impl.GetWorker(ctx, name)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, apierror.NotFound("Worker %s not found", name)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("while getting worker %s: %w", name, err)
+	}
+	return s.mutateWorker(ctx, name, store.PreconditionFrom(observed), mutate)
 }
 
 // mutateWorker runs mutate against the named Worker and translates what comes
@@ -296,14 +340,16 @@ func (s *RPCService) mutateWorker(ctx context.Context, name string, precondition
 		return unchanged.worker, nil
 	}
 	switch {
+	case errors.Is(err, errWorkerDraining):
+		return nil, apierror.FailedPrecondition("Worker %s is draining", name)
 	case errors.Is(err, store.ErrNotFound):
-		return nil, status.Errorf(codes.NotFound, "Worker %s not found", name)
+		return nil, apierror.NotFound("Worker %s not found", name)
 	case errors.Is(err, store.ErrUIDConflict):
-		return nil, status.Errorf(codes.Aborted, "Worker %s is not the one the request describes", name)
+		return nil, apierror.Aborted("Worker %s is not the one the request describes", name)
 	case errors.Is(err, store.ErrVersionConflict):
-		return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+		return nil, apierror.Aborted("concurrent update conflict, please retry")
 	case errors.Is(err, store.ErrPreconditionRequired):
-		return nil, status.Errorf(codes.InvalidArgument, "while updating worker %s: %v", name, err)
+		return nil, apierror.InvalidArgument("while updating worker %s: %v", name, err)
 	}
 	return nil, fmt.Errorf("while updating worker: %w", err)
 }

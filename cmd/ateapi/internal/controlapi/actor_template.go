@@ -19,13 +19,12 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/apivalidation"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/defaults"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
+	"go.ate.dev/substrate/cmd/ateapi/internal/defaults"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
@@ -42,13 +41,7 @@ func (s *RPCService) CreateActorTemplate(ctx context.Context, req *ateapipb.Crea
 
 	// Validate the request, including the object within it.
 	if errs := apivalidation.ValidateCreateActorTemplateRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
-	}
-
-	// config_name is required; the declarative validation has already
-	// rejected an empty one.
-	if _, err := resolveTemplateSandboxConfig(s.sandboxConfigLister, in.GetSandboxConfig()); err != nil {
-		return nil, err
+		return nil, resources.ToAPIError(errs)
 	}
 
 	templateRef := resources.ActorTemplateRefFromActorTemplate(in)
@@ -56,10 +49,10 @@ func (s *RPCService) CreateActorTemplate(ctx context.Context, req *ateapipb.Crea
 	stored, err := s.impl.CreateActorTemplate(ctx, in)
 	if err != nil {
 		if errors.Is(err, store.ErrAlreadyExists) {
-			return nil, status.Errorf(codes.AlreadyExists, "ActorTemplate %s already exists", templateRef)
+			return nil, apierror.AlreadyExists("ActorTemplate %s already exists", templateRef)
 		}
 		if errors.Is(err, store.ErrFailedPrecondition) {
-			return nil, status.Error(codes.FailedPrecondition, err.Error())
+			return nil, apierror.FailedPrecondition("%v", err)
 		}
 		return nil, fmt.Errorf("while recording actor template: %w", err)
 	}
@@ -74,7 +67,13 @@ func (s *ServiceImpl) CreateActorTemplate(ctx context.Context, inTemplate *ateap
 
 	// Validate the final value before storing it.
 	if errs := apivalidation.ValidateActorTemplateUpdate(ctx, field.NewPath("actor_template"), outTemplate, inTemplate); len(errs) > 0 {
-		return nil, toGRPCInternalError(errs)
+		return nil, resources.ToInternalError(errs)
+	}
+
+	// Reject a template whose actors could never be snapshotted, rather than
+	// failing their first suspend or tag.
+	if _, err := resolveSnapshotLocation(s.clusterSnapshotLocation, outTemplate); err != nil {
+		return nil, err
 	}
 
 	return s.store.CreateActorTemplate(ctx, outTemplate)
@@ -82,13 +81,13 @@ func (s *ServiceImpl) CreateActorTemplate(ctx context.Context, inTemplate *ateap
 
 func (s *RPCService) GetActorTemplate(ctx context.Context, req *ateapipb.GetActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
 	if errs := apivalidation.ValidateGetActorTemplateRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 
 	templateRef := resources.ActorTemplateRefFromObjectRef(req.GetActorTemplate())
 	template, err := s.impl.GetActorTemplate(ctx, templateRef)
 	if errors.Is(err, store.ErrNotFound) {
-		return nil, status.Errorf(codes.NotFound, "ActorTemplate %s not found", templateRef)
+		return nil, apierror.NotFound("ActorTemplate %s not found", templateRef)
 	} else if err != nil {
 		return nil, fmt.Errorf("while getting actor template from DB: %w", err)
 	}
@@ -103,10 +102,10 @@ func (s *ServiceImpl) GetActorTemplate(ctx context.Context, templateRef resource
 
 func (s *RPCService) ListActorTemplates(ctx context.Context, req *ateapipb.ListActorTemplatesRequest) (*ateapipb.ListActorTemplatesResponse, error) {
 	if errs := apivalidation.ValidateListActorTemplatesRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 
-	page, err := s.impl.ListActorTemplates(ctx, req.GetAtespace(), store.ListOptions{PageSize: effectivePageSize(req.GetPageSize()), PageToken: req.GetPageToken()})
+	page, err := s.impl.ListActorTemplates(ctx, req.GetAtespace(), toStoreListOptions(req.GetOptions()))
 	if err != nil {
 		return nil, mapListError(fmt.Errorf("while listing actor templates in db: %w", err))
 	}
@@ -123,9 +122,13 @@ func (s *ServiceImpl) ListActorTemplates(ctx context.Context, atespace string, o
 
 func (s *RPCService) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
 	if errs := apivalidation.ValidateDeleteActorTemplateRequest(ctx, req); len(errs) > 0 {
-		return nil, resources.ToGRPCStatusError(errs)
+		return nil, resources.ToAPIError(errs)
 	}
 	return s.actorWorkflow.DeleteActorTemplate(ctx, resources.ActorTemplateRefFromObjectRef(req.GetActorTemplate()), toDeletePreconditions(req.GetOptions()))
+}
+
+func (s *ServiceImpl) MarkActorTemplateForDeletion(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions, mutate func(*ateapipb.ActorTemplate) error) (*ateapipb.ActorTemplate, error) {
+	return s.store.MarkActorTemplateForDeletion(ctx, templateRef, precondition, mutate)
 }
 
 func (s *ServiceImpl) DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapipb.ActorTemplate, error) {
@@ -150,7 +153,7 @@ type actorTemplateGetter interface {
 // the actor names a template that does not exist. Most callers return the
 // error as is — it already carries FailedPrecondition — while delete
 // tolerates it and cleans up without the template.
-var errActorTemplateNotFound = status.New(codes.FailedPrecondition, "actor template not found").Err()
+var errActorTemplateNotFound = apierror.FailedPrecondition("actor template not found")
 
 // resolveActorTemplate resolves the substrate ActorTemplate the actor's
 // actor_template ref names. A missing template surfaces as
@@ -165,14 +168,4 @@ func resolveActorTemplate(ctx context.Context, st actorTemplateGetter, actor *at
 		return nil, fmt.Errorf("while getting ActorTemplate: %w", err)
 	}
 	return template, nil
-}
-
-// actorTemplateObjectRef returns a fresh copy of the actor's template
-// reference — fresh so records built from it never alias the actor message.
-func actorTemplateObjectRef(actor *ateapipb.Actor) *ateapipb.ObjectRef {
-	ref := actor.GetActorTemplate()
-	if ref == nil {
-		return nil
-	}
-	return &ateapipb.ObjectRef{Atespace: ref.GetAtespace(), Name: ref.GetName()}
 }

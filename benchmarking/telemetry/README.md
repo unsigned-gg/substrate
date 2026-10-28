@@ -37,13 +37,17 @@ Install the meter, then send the control plane to it:
 kubectl apply -f benchmarking/telemetry/meter.yaml
 
 METER=http://telemetry-meter.benchmarking.svc.cluster.local:4317
-./hack/install-ate.sh --deploy-ate-system --otlp-endpoint "${METER}"
+
+go run ./cmd/ate-setup deploy ate-system \
+  --credential-provider='{"name":"k8s.io"}' \
+  --ingress-allowed-spiffe-ids=spiffe://cluster.local/ns/benchmarking/sa/default \
+  --otlp-endpoint "${METER}"
 ```
 
 `--otlp-endpoint` patches the `ate-otel-config` ConfigMap and restarts the
 workloads that read it. One patch is sufficient for `ateapi`, `ate-controller`,
 `atelet`, and `atenet-router`, because each one reads the ConfigMap through
-`envFrom`. `ate-controller` also copies the values to the ateom worker pods
+`envFrom`. `ate-controller` also copies the values to the worker pods
 that it creates.
 
 The actor containers are different. Substrate puts no OTLP configuration in
@@ -223,7 +227,9 @@ upgrade.
 ## Remove the meter
 
 ```bash
-./hack/install-ate.sh --deploy-ate-system
+go run ./cmd/ate-setup deploy ate-system \
+  --credential-provider='{"name":"k8s.io"}' \
+  --ingress-allowed-spiffe-ids=spiffe://cluster.local/ns/benchmarking/sa/default
 ./benchmarking/workloads/deploy.sh --deploy
 kubectl delete -f benchmarking/telemetry/meter.yaml
 ```

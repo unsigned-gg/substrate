@@ -14,16 +14,21 @@ The actor never holds the secret. It sends the header with a placeholder
 value, which the gateway discards, so it cannot read, snapshot, or exfiltrate
 the secret, nor choose the value that leaves the cluster.
 
+The gateway can also inject an **actor JWT** in place of a stored secret: a
+token that ateapi mints for the actor making the request, which an upstream
+that trusts Substrate's issuer can verify. See [Actor JWTs](#actor-jwts).
+
 
 ## When you need this
 
 Actors call APIs that need bearer tokens or API keys, and those secrets must
-stay out of the actor's filesystem, environment, and snapshots.
+stay out of the actor's filesystem, environment, and snapshots. Other APIs
+need to know which actor is calling and accept a signed token that says so;
+for those, inject an actor JWT.
 
-Injection happens only on HTTPS that an `https` rule allows, so the actor must
-make the request over HTTPS and must trust the gateway CA — see
-[egress-trust-bundle.md](egress-trust-bundle.md). Cleartext HTTP allowed by an
-`http` rule is never injected into.
+Injection is supported on HTTP and HTTPS requests allowed by an `http` or
+`https` rule with credential replacement effects. For HTTPS, the actor must
+trust the gateway CA — see [egress-trust-bundle.md](egress-trust-bundle.md).
 
 ## How it works
 
@@ -33,11 +38,13 @@ flowchart LR
     gateway["Egress gateway<br/>applies the EgressPolicy"]
     provider["Credential provider"]
     store[("Secret store")]
+    ateapi["ateapi"]
     upstream["Upstream API"]
 
     actor -->|"HTTPS request,<br/>placeholder header"| gateway
-    gateway -->|"fetch credential<br/>for this actor"| provider
+    gateway -->|"credentialUri:<br/>fetch credential<br/>for this actor"| provider
     provider -->|"authorize, then read"| store
+    gateway -->|"actorJwt:<br/>mint a JWT<br/>for this actor"| ateapi
     gateway -->|"request with<br/>the credential"| upstream
 ```
 
@@ -56,13 +63,17 @@ flowchart LR
 4. The gateway replaces the placeholder with the credential and sends the
    request on to the origin over a new TLS connection.
 
+For an actor JWT, steps 2 and 3 go to ateapi instead of a credential provider:
+the gateway asks ateapi to mint a token for the actor, or reuses one it minted
+earlier.
+
 The reference k8s secret provider, `cmd/credential-provider/kubernetes-secrets`, resolves
 Kubernetes Secrets and is the one [For cluster admins](#for-cluster-admins)
 deploys.
 
 ## The policy
 
-Injection is declared in the `effects` of an `https` rule. This policy allows
+Injection is declared in the `effects` of an `http` or `https` rule. This policy allows
 HTTPS to `api.example.com` on port 443, the default, and replaces the actor's
 `Authorization` header with a credential:
 
@@ -105,75 +116,161 @@ interpret. A URI the provider refuses denies the request with 403.
   `secretmanager.googleapis.com`) — see its
   [README](../internal/plugins/gcp-secret-manager/README.md#credential-uris).
 
+### Actor JWTs
+
+An entry can set `actorJwt` in place of `credentialUri`. The gateway then puts
+the prefix and a JWT that ateapi minted for the actor into the header. No
+credential provider is involved, so this works on a gateway installed with
+`--credential-provider='{"enabled":false}'`.
+
+```yaml
+rules:
+- https:
+    hostnames: ["api.example.com"]
+    effects:
+      replaceHeaders:
+      - header: Authorization
+        prefix: "Bearer "
+        actorJwt:
+          audiences: ["https://api.example.com"]
+          expirationSeconds: 900
+```
+
+* `audiences` become the token's `aud` claim: 1 to 16 distinct values, each
+  up to 512 characters. Use the value the upstream checks the audience
+  against.
+* `expirationSeconds` is the token's lifetime, from 300 to 3600 seconds, with
+  no default.
+* An entry sets exactly one of `credentialUri` and `actorJwt`.
+
+The token's `sub` is `actor/<atespace>/<actor-name>`, and its `iss` is the
+issuer the install gave ateapi (`ACTOR_JWT_ISSUER`). It also names the actor's
+atespace, name, and UID. ateapi signs it with the install's actor JWT signing
+key, which `kubectl ate admin` rotates (see the
+[kubectl-ate README](../cmd/kubectl-ate/README.md)).
+
+The gateway reuses a token for the same actor, audiences, and lifetime until a
+third of its lifetime is left, so the upstream always gets a token with at
+least that much time remaining: 300 seconds for the 900-second lifetime above.
+Concurrent requests that need the same token share one mint.
+
 ## What the gateway does
 
 | Situation | Outcome |
 |---|---|
-| Request decided by an `https` rule, carries the header, provider configured, credential resolves | Header value replaced with the credential; request re-originated upstream |
-| Request decided by an `https` rule, does not carry the header | Forwarded without the credential. |
-| Cleartext request decided by an `http` rule with `replaceHeaders` | Injection **skipped**, request passes through without the credential — a secret is never put on a cleartext wire |
-| No provider configured (injection not enabled at install) | Injection **skipped**, request passes through — a policy that asks for injection does not break egress on a gateway that cannot perform it |
+| Request decided by an `http` or `https` rule, carries the header, provider configured, credential resolves | Header value replaced with the credential; request re-originated upstream |
+| Request decided by an `http` or `https` rule, does not carry the header | Forwarded unchanged; no credential is fetched |
+| Request decided by an `http` or `https` rule, carries the header, no provider configured (`--credential-provider='{"enabled":false}'`) | **500** (Envoy) or **403** (agentgateway), fail closed |
 | Secret missing, or namespace not authorized for the atespace | **403**, fail closed |
 | Provider unreachable or timed out | **503**, fail closed but retryable |
 | Provider returns an empty credential, or one containing control characters | **503**, fail closed |
-| URI names a provider class this gateway does not serve; unusable header name; unparseable URI | **500**, fail closed |
+| URI names a provider class this gateway does not serve; unusable header name; unparseable URI | **500** (Envoy) or **403** (agentgateway), fail closed |
+| Request decided by an `http` or `https` rule, carries the header of an `actorJwt` entry, mint succeeds | Header value replaced with the prefix and the actor's JWT, with or without a provider |
+| `actorJwt` entry, the actor no longer exists | **403**, fail closed |
+| `actorJwt` entry, ateapi unreachable or timed out | **503**, fail closed but retryable |
+| `actorJwt` entry, any other mint failure | **500** (Envoy) or **403** (agentgateway), fail closed |
 
-The dividing line: skipping is only for a gateway that was never asked to
-inject on this request. Once injection is *attempted* — an intercepted HTTPS
-request, provider configured — any failure to produce the credential the
-policy promised denies the request rather than letting it out without it.
+A request that does not carry the header skips injection. On an HTTP or HTTPS
+request that carries it, any failure to produce the credential, including
+having no provider, denies the request rather than letting it out without
+the credential.
 
 ## For cluster admins
 
 ### Enable it
 
-**1. The gateway.** Injection is an install-time modifier on the egress
-gateway and requires the Envoy dataplane (the default):
+**1. The gateway.** The provider is selected when the egress gateway is
+deployed, with `--deploy-ate-system` or `--deploy-atenet`, for either the Envoy
+or agentgateway dataplane. The selection is required: an install that wants
+no injection says so with `{"enabled":false}`.
 
 ```bash
-hack/install-ate.sh --deploy-atenet --experimental-egress-credential-injection
+hack/install-ate.sh --deploy-atenet --credential-provider='{"name":"k8s.io"}'
 ```
 
-| Flag | Purpose | Default |
-|---|---|---|
-| `--credential-provider-name` | Provider class the gateway serves, as an `ate-secret://` prefix; a policy URI of any other class fails closed | `ate-secret://k8s.io` |
-| `--credential-provider-address` | Where the gateway dials the provider | `k8s-credential-provider.ate-system.svc:50051` |
+`--credential-provider` (or `ATE_CREDENTIAL_PROVIDER` when the flag is
+absent) is a JSON object with these keys; any other key is an error:
 
-**2. The provider.** A separate component — the flag above only configures the
-gateway's client side. Until something serves the configured address, every
-matching injection rule fails closed with 503. For the Kubernetes Secrets
-provider, deploy the manifests under `manifests/egress-credential-injection/`:
+| Key | Value |
+|---|---|
+| `enabled` | Defaults to `true`. `false` turns injection off, and then no other key is allowed |
+| `name` | Required unless `enabled` is `false`. A DNS name: `k8s.io` for the bundled Kubernetes Secrets provider, or the name of a provider you deploy, which is the host of the `ate-secret://` URIs it serves, e.g. `vault.example.com` for `ate-secret://vault.example.com/...`. A policy URI naming any other provider fails closed |
+| `address` | The `host:port` the gateway dials the provider at. Required for a provider you deploy; optional with `k8s.io`, where it defaults to the bundled provider's Service, `k8s-credential-provider.ate-system.svc:50051` |
+
+For example:
 
 ```bash
-# The atespace→namespace authorization policy (edit for your atespaces first;
-# default-deny, so an atespace absent from it resolves nothing):
-kubectl apply -f manifests/egress-credential-injection/namespace-policy.yaml
-
-# A sample secret matching the sample policy:
-kubectl apply -f manifests/egress-credential-injection/sample-secret.yaml
-
-# The provider itself (ko builds its image):
-hack/run-tool.sh ko apply -f manifests/egress-credential-injection/k8s-credential-provider.yaml
+--credential-provider='{"name":"k8s.io"}'
+--credential-provider='{"enabled":false}'
+--credential-provider='{"name":"vault.example.com","address":"vault-provider.ate-system.svc:50051"}'
 ```
 
-The provider loads the namespace policy **once at startup** and does not yet
-reload it. After editing the ConfigMap, restart the provider:
+**2. The provider.** With `k8s.io` the install deploys the Kubernetes Secrets
+provider itself, from `manifests/egress-credential-injection/`, and waits for
+it alongside the gateway. The install applies:
+
+* the provider's ServiceAccount, its Deployment and its Service in
+  `ate-system`;
+* a ClusterRole and ClusterRoleBinding that let it read Secrets in every
+  namespace;
+* the `k8s-credential-provider-namespace-policy` ConfigMap, only when it is
+  absent (see below); and
+* a NetworkPolicy that admits only the egress gateway's pods
+  (`app: atenet-egress`), on the provider's gRPC port. Every other connection
+  to the provider pods is dropped. The NetworkPolicy takes effect only on a
+  cluster whose network plugin enforces NetworkPolicy, such as GKE Dataplane
+  V2, which `tools/setup-gcp` turns on by default. Elsewhere the provider's
+  check of the gateway's client certificate is the only restriction.
+
+Selecting any other provider, or `{"enabled":false}`, removes a bundled
+provider an earlier install left behind, NetworkPolicy included. A provider of
+your own is yours to deploy, and until something serves the configured address
+every matching injection rule fails closed with 503.
+
+The provider enforces an atespace→namespace authorization policy, the
+`k8s-credential-provider-namespace-policy` ConfigMap in `ate-system`. The install creates
+it empty, granting nothing, and only when it is absent, so a redeploy keeps
+edits. Grant each atespace the namespaces whose Secrets it may resolve:
+
+```bash
+kubectl -n ate-system edit configmap k8s-credential-provider-namespace-policy
+```
+
+```yaml
+  namespace-policy.yaml: |
+    policies:
+    - atespace: team-a
+      allowedNamespaces:
+      - ns1
+```
+
+The provider loads the policy **once at startup** and does not yet reload it,
+so after editing, restart the provider:
 
 ```bash
 kubectl -n ate-system rollout restart deployment/k8s-credential-provider
 ```
 
+For a first smoke test, grant your actor's atespace `ns1` as above and apply a
+sample secret that the URI in the sample policy resolves to:
+
+```bash
+kubectl apply -f manifests/egress-credential-injection/sample-secret.yaml
+```
+
 **3. The actors.** Actors can now add `replaceHeaders` effects to their
 `https` rules, as described under [The policy](#the-policy). Each such actor
 also needs the projected egress trust bundle to do TLS through the gateway at
-all — see [egress-trust-bundle.md](egress-trust-bundle.md).
+all — see [egress-trust-bundle.md](egress-trust-bundle.md). Actor JWT entries
+need no provider; ateapi signs them with a key that every install creates.
 
 ### Verify
 
-Confirm the provider is ready:
+Confirm the provider is ready and its NetworkPolicy is in place:
 
 ```bash
 kubectl -n ate-system rollout status deployment/k8s-credential-provider
+kubectl -n ate-system get networkpolicy k8s-credential-provider
 ```
 
 Then give an actor an `https` rule for `httpbin.org` that replaces a header,
@@ -194,6 +291,11 @@ and recreated, the channel can sit in connect backoff for up to a couple of
 minutes before re-resolving; injection fails closed with 503 (deliberately
 retryable) until it reconnects.
 
+**Actor JWTs follow the actor's name.** The gateway caches tokens by actor
+name. An actor that is deleted and recreated under the same name can get its
+predecessor's token until that token's refresh point, up to two thirds of its
+lifetime, and that token's UID claim names the old actor.
+
 **Scope of the reference provider's RBAC.** The sample deployment grants read
 on Secrets cluster-wide so the policy may name any namespace; a production
 deployment should scope this to the namespaces the provider is allowed to
@@ -208,8 +310,9 @@ The provider is a plugin: any gRPC service that implements
 can back injection. To bring your own — reading HashiCorp Vault, Google Secret
 Manager, or any other secret store — implement the API under your own provider
 class (the URI host, e.g. `ate-secret://vault.example.com/...`), then have a
-cluster admin point the gateway at it with `--credential-provider-name` and
-`--credential-provider-address`. A gateway currently fronts **one** provider:
+cluster admin point the gateway at it with
+`--credential-provider='{"name":"vault.example.com","address":"<host>:<port>"}'`.
+A gateway currently fronts **one** provider:
 a policy URI naming any other class fails closed rather than being sent to the
 wrong provider.
 
@@ -246,13 +349,13 @@ may only resolve Secrets in namespaces explicitly granted to it.
 
 ## See also
 
-* [egress-trust-bundle.md](egress-trust-bundle.md) — the TLS-terminated leg
-  this feature runs on, and the actor-side trust projection it presupposes.
+* [egress-trust-bundle.md](egress-trust-bundle.md) — the actor-side trust
+  projection needed for HTTPS injection.
 * `demos/egress/README.md` — how tunneled egress, actor identity, and policy
   authorization fit together.
 * `pkg/proto/credproviderpb/credprovider.proto` — the provider plugin API and
   its trust model.
 * `cmd/credential-provider/kubernetes-secrets` — the reference provider.
 * `internal/e2e/suites/egresscredinject` — the e2e suite that proves the
-  behavior table above. It runs only with `E2E_EGRESS_CREDINJECT=1`, against a
-  cluster installed with `--experimental-egress-credential-injection`.
+  behavior table above on both sandbox classes, against a cluster installed
+  with `--credential-provider='{"name":"k8s.io"}'`.

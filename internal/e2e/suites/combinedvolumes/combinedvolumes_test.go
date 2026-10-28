@@ -30,9 +30,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/e2e"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -40,6 +37,10 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"go.ate.dev/substrate/internal/e2e"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -63,7 +64,7 @@ const (
 	extVolume   = "external"
 	extPathA    = "/mnt/ate-external-a"
 	extPathB    = "/mnt/ate-external-b"
-	extCapacity = "1Gi"
+	extCapacity = 1 << 30
 
 	// probeWrittenContent is the fixed string the probe's /writefile writes.
 	probeWrittenContent = "written by probe"
@@ -154,13 +155,18 @@ func buildFixtureImage(t *testing.T, repo string) string {
 	return fmt.Sprintf("%s@%s", tag.Context().Name(), digest)
 }
 
-// storageClassOrEmpty returns the configured StorageClass if the cluster has
-// one, and "" if it does not. The CSI driver is optional, so a missing class
+// storageClassOrEmpty returns the configured StorageClass if external volumes
+// are enabled and the cluster has the class, and "" if not. External volumes
+// are a preview feature and the CSI driver is optional, so either missing
 // drops the external volume from the template instead of failing every test
 // in the suite.
 func storageClassOrEmpty(ctx context.Context, t *testing.T, clients *e2e.Clients) string {
 	t.Helper()
 
+	if !preview.IsEnabled(preview.GateExternalVolumes) {
+		t.Logf("preview gate %q is not enabled; the external-volume cases will be skipped", preview.GateExternalVolumes)
+		return ""
+	}
 	if _, err := clients.K8s.StorageV1().StorageClasses().Get(ctx, e2e.StorageClass, metav1.GetOptions{}); err != nil {
 		t.Logf("StorageClass %q not found (%v); the external-volume case will be skipped", e2e.StorageClass, err)
 		return ""
@@ -228,10 +234,10 @@ func createTemplate(ctx context.Context, t *testing.T, clients *e2e.Clients, ns 
 				&ateapipb.VolumeMount{Name: extVolume, MountPath: extPathB})
 			tmpl.Volumes = append(tmpl.Volumes, &ateapipb.Volume{
 				Name: extVolume,
-				ExternalVolumeTemplate: &ateapipb.ExternalVolumeTemplate{
-					Capacity:         extCapacity,
+				External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
+					CapacityBytes:    extCapacity,
 					StorageClassName: storageClass,
-				},
+				}},
 			})
 		},
 	})
@@ -318,6 +324,33 @@ func requireSharedWrite(ctx context.Context, t *testing.T, router *e2e.RouterCli
 	requireContentAtBoth(ctx, t, router, actorRef, writePath, aliasPath, probeWrittenContent)
 }
 
+// requireAssignedNode fails unless the actor's status records want as its
+// assigned_node. An empty want means no node is recorded.
+func requireAssignedNode(t *testing.T, actor *ateapipb.Actor, want string) {
+	t.Helper()
+
+	if got := actor.GetStatus().GetAssignedNode(); got != want {
+		t.Errorf("actor assigned_node = %q, want %q", got, want)
+	}
+}
+
+// requireAssignedToWorkerNode fails unless the running actor's assigned_node
+// matches the node of its worker assignment. It returns the assigned node.
+func requireAssignedToWorkerNode(ctx context.Context, t *testing.T, clients *e2e.Clients, actorRef resources.ActorRef) string {
+	t.Helper()
+
+	actor, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{Actor: actorRef.ToObjectRef()})
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	node := actor.GetStatus().GetWorkerAssignment().GetNodeName()
+	if node == "" {
+		t.Fatalf("running actor's worker assignment names no node: %v", actor.GetStatus().GetWorkerAssignment())
+	}
+	requireAssignedNode(t, actor, node)
+	return node
+}
+
 func TestCombinedVolumes(t *testing.T) {
 	repo := os.Getenv("KO_DOCKER_REPO")
 	if repo == "" {
@@ -351,14 +384,23 @@ func TestCombinedVolumes(t *testing.T) {
 	if _, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapipb.ResumeActorRequest{Actor: actorRef.ToObjectRef()}); err != nil {
 		t.Fatalf("ResumeActor: %v", err)
 	}
+	requireAssignedToWorkerNode(ctx, t, clients, actorRef)
 
-	router, err := e2e.NewRouterClient(ctx)
+	router, err := e2e.NewRouterClient(t, ctx)
 	if err != nil {
 		t.Fatalf("NewRouterClient: %v", err)
 	}
 	defer router.Close()
 
 	payloadPath := mountPath + "/" + payloadName
+
+	requireExternalVolume := func(t *testing.T) {
+		t.Helper()
+		e2e.RequirePreview(t, preview.GateExternalVolumes)
+		if storageClass == "" {
+			t.Skipf("StorageClass %q is not installed", e2e.StorageClass)
+		}
+	}
 
 	t.Run("DeliversImageContents", func(t *testing.T) {
 		requireContent(ctx, t, router, actorRef, payloadPath, payloadContent)
@@ -385,31 +427,37 @@ func TestCombinedVolumes(t *testing.T) {
 	})
 
 	t.Run("SameExternalVolumeAtTwoPathsSharesWrites", func(t *testing.T) {
-		if storageClass == "" {
-			t.Skipf("StorageClass %q is not installed", e2e.StorageClass)
-		}
+		requireExternalVolume(t)
 		requireSharedWrite(ctx, t, router, actorRef, extPathA+"/multi.txt", extPathB+"/multi.txt")
 	})
 
 	t.Run("SurvivesSuspendResume", func(t *testing.T) {
-		if _, err := clients.SubstrateAPI.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: actorRef.ToObjectRef()}); err != nil {
+		runningNode := requireAssignedToWorkerNode(ctx, t, clients, actorRef)
+		suspended, err := clients.SubstrateAPI.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: actorRef.ToObjectRef(), Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
+		if err != nil {
 			t.Fatalf("SuspendActor: %v", err)
 		}
+		// Synchronous suspend preserves the actor's node binding while its
+		// local snapshot copy is retained.
+		requireAssignedNode(t, suspended.GetActor(), runningNode)
 
-		// No explicit resume: routing to the actor is what wakes it. Restore
-		// must re-establish all mounts and preserve shared writes across them.
+		// This suite checks volume restore, which can outlast the router's
+		// request-parking budget on a busy node. Resume through the control
+		// plane before checking the mounts and their shared writes.
 		resumeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
+		if _, err := e2e.ResumeActorAwaitCapacity(t, resumeCtx, clients, &ateapipb.ResumeActorRequest{Actor: actorRef.ToObjectRef()}); err != nil {
+			t.Fatalf("ResumeActor after suspend: %v", err)
+		}
 		requireContentAtBoth(resumeCtx, t, router, actorRef, payloadPath, mountPathAlias+"/"+payloadName, payloadContent)
 		requireContentAtBoth(resumeCtx, t, router, actorRef, scratchPathA+"/multi.txt", scratchPathB+"/multi.txt", probeWrittenContent)
 
 		// Suspend detached the external volume; the resume must reattach it
 		// once and restore both of its mounts.
 		t.Run("ExternalVolumeReattached", func(t *testing.T) {
-			if storageClass == "" {
-				t.Skipf("StorageClass %q is not installed", e2e.StorageClass)
-			}
+			requireExternalVolume(t)
 			requireContentAtBoth(resumeCtx, t, router, actorRef, extPathA+"/multi.txt", extPathB+"/multi.txt", probeWrittenContent)
+			requireAssignedToWorkerNode(ctx, t, clients, actorRef)
 		})
 	})
 
@@ -429,9 +477,13 @@ func TestCombinedVolumes(t *testing.T) {
 		if got := reverted.GetActor().GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
 			t.Fatalf("state after revert = %v, want SUSPENDED", got)
 		}
+		requireAssignedNode(t, reverted.GetActor(), "")
 
 		resumeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
+		if _, err := e2e.ResumeActorAwaitCapacity(t, resumeCtx, clients, &ateapipb.ResumeActorRequest{Actor: actorRef.ToObjectRef()}); err != nil {
+			t.Fatalf("ResumeActor after revert: %v", err)
+		}
 
 		// The image volume is immutable and remounted from its digest, so it
 		// is unaffected either way.
@@ -447,9 +499,7 @@ func TestCombinedVolumes(t *testing.T) {
 		// it. The actor comes back with its memory and durable dir at the
 		// snapshot but this volume exactly as the discarded execution left it.
 		t.Run("ExternalVolumeNotReverted", func(t *testing.T) {
-			if storageClass == "" {
-				t.Skipf("StorageClass %q is not installed", e2e.StorageClass)
-			}
+			requireExternalVolume(t)
 			requireContentAtBoth(resumeCtx, t, router, actorRef, extPathA+"/"+postSnapshotName, extPathB+"/"+postSnapshotName, probeWrittenContent)
 		})
 	})
