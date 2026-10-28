@@ -215,6 +215,10 @@ type Config struct {
 	// (ATE_INSTALL_FAKE_DATA_PLANE), for control-plane benchmarks.
 	FakeDataPlane bool
 
+	// ManifestComponents are repo-relative kustomize component directories
+	// (ATE_MANIFESTS_COMPONENTS) composed into every control plane apply.
+	ManifestComponents []string
+
 	// IngressAllowedSPIFFEIDs are the SPIFFE IDs the ingress router lets
 	// reach actors over its TLS listeners (ATE_INGRESS_ALLOWED_SPIFFE_IDS).
 	// See RequireIngressAllowedSPIFFEIDs.
@@ -304,6 +308,12 @@ func (c *Config) TransferServiceAccount() string {
 // ate-setup installs GCS everywhere but kind, which uses S3.
 func (c *Config) RequireTransferServiceAccount() error {
 	if c.Kind {
+		return nil
+	}
+	// The transfer service account is a GCS concept: an S3 snapshot location
+	// (rustfs, MinIO, AWS) has nothing to impersonate, and the sidecar's
+	// argument is written empty, as on kind.
+	if strings.HasPrefix(c.SnapshotLocation, "s3://") {
 		return nil
 	}
 	if c.TransferGSAName == "" {
@@ -515,6 +525,10 @@ func (c *Config) ScriptEnv() []string {
 	delete(merged, "ATE_INSTALL_FAKE_DATA_PLANE")
 	if c.FakeDataPlane {
 		merged["ATE_INSTALL_FAKE_DATA_PLANE"] = "true"
+	}
+	delete(merged, "ATE_MANIFESTS_COMPONENTS")
+	if len(c.ManifestComponents) > 0 {
+		merged["ATE_MANIFESTS_COMPONENTS"] = strings.Join(c.ManifestComponents, ",")
 	}
 	delete(merged, "ATE_INGRESS_ALLOWED_SPIFFE_IDS")
 	if len(c.IngressAllowedSPIFFEIDs) > 0 {

@@ -1429,3 +1429,62 @@ func TestLoadImageSource(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadManifestComponents(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want []string
+	}{
+		{name: "unset", want: nil},
+		{name: "one", env: "manifests/ate-install/components/cygnus", want: []string{"manifests/ate-install/components/cygnus"}},
+		{name: "two", env: "a/b, c/d", want: []string{"a/b", "c/d"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			t.Setenv("ATE_MANIFESTS_COMPONENTS", tc.env)
+			cfg, err := Load(Options{})
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !slices.Equal(cfg.ManifestComponents, tc.want) {
+				t.Errorf("ManifestComponents = %v, want %v", cfg.ManifestComponents, tc.want)
+			}
+			got, exported := scriptEnvMap(t, cfg)["ATE_MANIFESTS_COMPONENTS"]
+			if exported != (len(tc.want) > 0) {
+				t.Errorf("ScriptEnv() exports ATE_MANIFESTS_COMPONENTS = %v, want %v", exported, len(tc.want) > 0)
+			}
+			if exported && got != strings.Join(tc.want, ",") {
+				t.Errorf("ScriptEnv() ATE_MANIFESTS_COMPONENTS = %q, want %q", got, strings.Join(tc.want, ","))
+			}
+		})
+	}
+}
+
+func TestRequireTransferServiceAccountS3(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		location string
+		wantErr  bool
+	}{
+		{name: "s3 location needs no transfer account", location: "s3://ate-snapshots/", wantErr: false},
+		{name: "gcs location still does", location: "gs://ate-snapshots/", wantErr: true},
+		{name: "unset location still does", location: "", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadEnv(t)
+			t.Setenv("SNAPSHOT_LOCATION", tc.location)
+			cfg, err := Load(Options{})
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Kind {
+				t.Fatal("test needs a non-kind config")
+			}
+			err = cfg.RequireTransferServiceAccount()
+			if (err != nil) != tc.wantErr {
+				t.Errorf("RequireTransferServiceAccount() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}

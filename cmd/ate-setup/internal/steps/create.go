@@ -222,8 +222,13 @@ func buildAuthenticationConfig(issuer string) string {
 	config := fmt.Sprintf(
 		"jwtProviders:\n- name: kubernetes\n  issuer: %s\n  audiences: [api.ate-system.svc]\n",
 		issuer)
-	switch issuer {
-	case inClusterIssuer, inClusterIssuer + ".cluster.local":
+	switch {
+	case issuer == inClusterIssuer || issuer == inClusterIssuer+".cluster.local" ||
+		strings.HasPrefix(issuer, "https://10.") ||
+		strings.HasPrefix(issuer, "https://192.168.") ||
+		strings.HasPrefix(issuer, "https://172.") ||
+		strings.Contains(issuer, ".svc") ||
+		strings.Contains(issuer, ".cluster.local"):
 		config += "  certificateAuthorityFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt\n" +
 			"  discoveryTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token\n"
 	}

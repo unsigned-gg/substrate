@@ -60,6 +60,9 @@ func (e *Env) components() []string {
 	if e.Cfg.CordonControlPlane {
 		components = append(components, e.Cfg.Path(cordonControlPlaneComponent))
 	}
+	for _, component := range e.Cfg.ManifestComponents {
+		components = append(components, e.Cfg.Path(component))
+	}
 	return components
 }
 
