@@ -21,7 +21,7 @@ package defaults
 import (
 	"fmt"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -51,7 +51,12 @@ func applyActorTemplateDefaults(t *ateapipb.ActorTemplate) {
 	if t == nil {
 		return
 	}
+	// snapshot_config is optional; an omitted one takes every default.
+	if t.SnapshotConfig == nil {
+		t.SnapshotConfig = &ateapipb.SnapshotConfig{}
+	}
 	applySnapshotConfigDefaults(t.SnapshotConfig)
+	applyEgressRuleDefaults(t.GetGoldenEgressPolicy().GetRules())
 	for _, c := range t.Containers {
 		applyContainerDefaults(c)
 	}
@@ -61,11 +66,14 @@ func applySnapshotConfigDefaults(sc *ateapipb.SnapshotConfig) {
 	if sc == nil {
 		return
 	}
-	if sc.OnPause == ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED {
-		sc.OnPause = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
+	if sc.PreferredFidelity == ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED {
+		sc.PreferredFidelity = ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
 	}
-	if sc.OnCommit == ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED {
-		sc.OnCommit = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
+	if sc.GoldenSnapshotConfig == nil {
+		sc.GoldenSnapshotConfig = &ateapipb.GoldenSnapshotConfig{}
+	}
+	if sc.GoldenSnapshotConfig.Mode == ateapipb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_UNSPECIFIED {
+		sc.GoldenSnapshotConfig.Mode = ateapipb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_ENABLED
 	}
 }
 
@@ -91,14 +99,15 @@ func applyActorDefaults(*ateapipb.Actor) {}
 
 func applyAtespaceDefaults(*ateapipb.Atespace) {}
 
-// applyEgressPolicyDefaults fills the port of an http or https rule that
+func applyEgressPolicyDefaults(p *ateapipb.EgressPolicy) {
+	applyEgressRuleDefaults(p.GetRules())
+}
+
+// applyEgressRuleDefaults fills the port of an http or https rule that
 // names none: the protocol's well-known port. A tls_passthrough rule has no
 // default; validation requires its ports.
-func applyEgressPolicyDefaults(p *ateapipb.EgressPolicy) {
-	if p == nil {
-		return
-	}
-	for _, r := range p.Rules {
+func applyEgressRuleDefaults(rules []*ateapipb.EgressRule) {
+	for _, r := range rules {
 		switch {
 		case r.GetHttp() != nil && r.Http.Ports == nil:
 			r.Http.Ports = &ateapipb.Ports{Numbers: []int32{80}}

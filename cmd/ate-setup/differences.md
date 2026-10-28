@@ -43,9 +43,9 @@ These were treated as contracts and reproduced exactly:
 - **Rendered bytes.** `authentication.yaml` is trimmed of its trailing newline
   because the shell built it inside `$(...)`, which strips them. Installing
   over a shell-installed cluster must not rewrite the ConfigMap.
-- **ko's ldflags.** `make ldflags` emitted `-X=<version pkg>.Version=$(git
+- **ko's ldflags.** The shell scripts stamped `-X=<version pkg>.Version=$(git
   describe --tags --always --dirty)`; `ko.Runner.ldflags` computes the identical
-  string without depending on make.
+  string.
 
 ## Execution model
 
@@ -111,7 +111,7 @@ Manifests carry `ko://<import path>` references either way. With `--image-repo`
 each is looked up in `images.Components` and rewritten to
 `<repo>/<base of the import path>:<tag>`, which is ko's own
 `--base-import-paths` naming and so is how the release images are already
-published — `ateapi`, `atelet`, `atenet`, `ateom-gvisor`, and the rest.
+published — `ateapi`, `atelet`, `atenet`, `ateworker-gvisor`, and the rest.
 `--image-tag` supplies the tag. Each of the two requires the other: a tag with
 no repository to pull from would be dropped, leaving a build from source that
 looks like the release the tag names.
@@ -121,19 +121,13 @@ The rewritten reference then keeps that tag and adds the digest it names, as
 tagged release. Resolving the digest is one HEAD request per image, cached for
 the install, so `--image-repo` needs read access to the registry from wherever
 `ate-setup` runs rather than only from the cluster. It is not optional: an
-ActorTemplate's container image, an image volume's reference, and a
-SandboxConfig's `pauseImage` each carry the CEL rule `self.contains('@')`, so an
-unpinned reference is rejected by admission and every demo fails to deploy.
+ActorTemplate's container image and an image volume's reference each carry the
+CEL rule `self.contains('@')`, so an unpinned reference is rejected by admission
+and every demo fails to deploy.
 Pinning also gives a pre-built install the property a `ko` install had for free,
 that a tag moving afterwards cannot change what is running.
 
-That tag also becomes the substrate version, which names the atelet DaemonSet
-and sets the node label partitioning nodes across coexisting versions. It has
-to: that label must describe the atelet actually running, which came from the
-image, not the checkout `git describe` happens to be sitting on. `VERSION`
-overrides it, as it always has.
-
-The rewrite is textual, one token at a time, matching `SubstituteVersion` above.
+The rewrite is textual, one token at a time.
 A reference is replaced wherever it appears, so the code needs no list of which
 fields hold images — `workerImage:` in a CRD spec is rewritten like any other —
 and the applied manifest differs from the checked-in YAML only in the image
@@ -238,14 +232,6 @@ demo is its own package registering itself from `init`, and
 `internal/demos/all` is the single list of what gets linked in — with a test
 asserting no demo package is missing from it.
 
-**Kind-only demos are visible but refuse.** `demo-autoscaled-workerpool`
-registered itself only when `ATE_INSTALL_KIND=true`, so on GKE
-`--deploy-demo-autoscaled-workerpool` was rejected as an *unknown option*. The
-cobra tree is built before flags are parsed, so `--kind` is not known yet; the
-subcommand always exists and fails at run time with `demo-autoscaled-workerpool
-is only supported for Kind installations; re-run with --kind`. `delete all`
-still skips it on a non-Kind install, via `demos.For`.
-
 **Template expansion is not sed.** The demo templates were expanded by a stack
 of `sed -e` expressions doing two things: substitute `${PLACEHOLDER}`, or delete
 the whole line (`/${NAME}/d`) when the placeholder is not in play.
@@ -298,11 +284,12 @@ shell-installed cluster rolls `ate-api-server` once.
 
 **Cloud SQL DSNs are synthesized, not adopted verbatim.** With
 `ATE_API_POSTGRES_CLOUDSQL_INSTANCE` set and no explicit
-`ATE_API_POSTGRES_CONNECTION_STRING`, the DSN is built passwordless
+`ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING`, the DSN is built passwordless
 against the proxy's loopback listener from the GSA's email
 ([`cloud-sql.md`](../../tools/setup-gcp/cloud-sql.md)), so
 `ATE_API_POSTGRES_CLOUDSQL_IAM_AUTH=false` is rejected rather than producing a
-DSN that cannot authenticate. An *unset* instance variable is distinct from an
+DSN that cannot authenticate. The owner connection uses the same IAM login
+unless `ATE_API_POSTGRES_OWNER_CONNECTION_STRING` is set. An *unset* instance variable is distinct from an
 exported empty one: unset adopts whatever the cluster already records in
 `ate-api-server-envvars`, including the IP type and the GSA from the
 `iam.gke.io/gcp-service-account` annotation, so a redeploy from a shell that

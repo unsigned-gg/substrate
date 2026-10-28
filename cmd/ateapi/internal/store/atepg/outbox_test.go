@@ -21,7 +21,6 @@ package atepg
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -31,19 +30,18 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 )
 
-// TestConnect_DedicatedWatchPool covers the dual-pool path only Connect
-// takes (the rest of the suite uses NewPersistence, where feed traffic
-// shares the caller's pool): the watch pool must be distinct and owned, and
-// the watch must deliver through it end to end.
+// TestConnect_DedicatedWatchPool covers the auxiliary-pool path only Connect
+// takes (the rest of the suite uses NewPersistence, where every operation
+// shares the caller's pool).
 func TestConnect_DedicatedWatchPool(t *testing.T) {
 	requirePool(t) // ensures the container is up and containerDSN is set
 	ctx := context.Background()
 
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -56,8 +54,14 @@ func TestConnect_DedicatedWatchPool(t *testing.T) {
 	if !p.ownsWatchPool {
 		t.Fatal("Connect must own the watch pool so Close releases it")
 	}
+	if p.ownerPool == p.pool || p.ownerPool == p.watchPool || !p.ownsOwnerPool {
+		t.Fatal("Connect must own a dedicated owner pool")
+	}
 	if got := p.watchPool.Config().MaxConns; got != watchPoolMaxConns {
 		t.Fatalf("watch pool MaxConns = %d, want %d", got, watchPoolMaxConns)
+	}
+	if got := p.ownerPool.Config().MaxConns; got != ownerPoolMaxConns {
+		t.Fatalf("owner pool MaxConns = %d, want %d", got, ownerPoolMaxConns)
 	}
 
 	clearAll(t, p)
@@ -860,7 +864,7 @@ func TestWatchWorkers_ClosesAfterPersistentPollFailure(t *testing.T) {
 
 	// Connect so the watcher has its own pool: killing it simulates a
 	// persistent outage without touching the shared container pool.
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -1037,7 +1041,7 @@ func TestLocalPublishReachesWatchers(t *testing.T) {
 	requirePool(t)
 	ctx := context.Background()
 
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -1087,7 +1091,7 @@ func TestLocalPublishReachesWatchers(t *testing.T) {
 	}
 
 	updated, err := p.UpdateWorker(ctx, created.GetMetadata().GetName(), store.PreconditionFrom(created), func(toUpdate *ateapipb.Worker) error {
-		toUpdate.Ips = []string{"10.0.0.9"}
+		toUpdate.Labels = map[string]string{"tier": "batch"}
 		return nil
 	})
 	if err != nil {
@@ -1097,8 +1101,8 @@ func TestLocalPublishReachesWatchers(t *testing.T) {
 	if got, want := ev.Worker.GetMetadata().GetVersion(), updated.GetMetadata().GetVersion(); got != want {
 		t.Errorf("updated event version = %d, want committed version %d", got, want)
 	}
-	if !slices.Equal(ev.Worker.GetIps(), []string{"10.0.0.9"}) {
-		t.Errorf("updated event carries Ips %q, want the committed mutation", ev.Worker.GetIps())
+	if got := ev.Worker.GetLabels()["tier"]; got != "batch" {
+		t.Errorf("updated event carries label tier=%q, want the committed mutation", got)
 	}
 	// The watcher's copy must be isolated from the caller's returned Worker.
 	if ev.Worker == updated {
@@ -1121,7 +1125,7 @@ func TestLocalPublishSurvivesWatchClose(t *testing.T) {
 	requirePool(t)
 	ctx := context.Background()
 
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}

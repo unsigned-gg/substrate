@@ -19,8 +19,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 )
 
 // TestSaveWorker_RejectsAStaleWrite proves the precondition saveWorker states
@@ -30,7 +30,7 @@ func TestSaveWorker_RejectsAStaleWrite(t *testing.T) {
 	requirePool(t)
 	ctx := context.Background()
 
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestSaveWorker_RejectsAStaleWrite(t *testing.T) {
 
 	// Move the stored Worker on, so the copy above is a version behind.
 	if _, err := p.UpdateWorker(ctx, created.GetMetadata().GetName(), store.PreconditionFrom(created), func(toUpdate *ateapipb.Worker) error {
-		toUpdate.Ips = []string{"10.0.0.1"}
+		toUpdate.Labels = map[string]string{"tier": "batch"}
 		return nil
 	}); err != nil {
 		t.Fatalf("UpdateWorker failed: %v", err)
@@ -72,7 +72,7 @@ func TestSaveWorker_RejectsAVanishedWorker(t *testing.T) {
 	requirePool(t)
 	ctx := context.Background()
 
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}

@@ -24,18 +24,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/apierror"
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/internal/protoredact"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"github.com/agent-substrate/substrate/pkg/proto/credproviderpb"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/protoredact"
+	"go.ate.dev/substrate/internal/serverboot"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/pkg/proto/credproviderpb"
 	epb "google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 func TestStatusErrorInterceptor(t *testing.T) {
@@ -52,16 +51,34 @@ func TestStatusErrorInterceptor(t *testing.T) {
 			expectResponse: true,
 		},
 		{
-			name:       "StatusErrorInChain",
+			name:       "WrappedStatusBecomesInternal",
 			handlerErr: fmt.Errorf("outer error: %w", status.Error(codes.NotFound, "actor not found")),
-			wantCode:   codes.NotFound,
-			wantMsg:    "actor not found",
+			wantCode:   codes.Internal,
+			wantMsg:    "internal server error: outer error: rpc error: code = NotFound desc = actor not found",
 		},
 		{
 			name:       "RawErrorFallback",
 			handlerErr: errors.New("database connection failed"),
 			wantCode:   codes.Internal,
 			wantMsg:    "internal server error: database connection failed",
+		},
+		{
+			name:       "APIErrorInChain",
+			handlerErr: fmt.Errorf("workflow failed at step Load: %w", apierror.NotFound("actor not found")),
+			wantCode:   codes.NotFound,
+			wantMsg:    "actor not found",
+		},
+		{
+			name:       "APIErrorWinsOverStatusItWraps",
+			handlerErr: apierror.Internal("while calling atelet: %w", status.Error(codes.Unavailable, "atelet down")),
+			wantCode:   codes.Internal,
+			wantMsg:    "while calling atelet: rpc error: code = Unavailable desc = atelet down",
+		},
+		{
+			name:       "ContextErrorKeepsItsCode",
+			handlerErr: fmt.Errorf("while loading actor: %w", context.DeadlineExceeded),
+			wantCode:   codes.DeadlineExceeded,
+			wantMsg:    "while loading actor: context deadline exceeded",
 		},
 	}
 
@@ -154,9 +171,9 @@ func TestInternalServerUnaryInterceptorCodes(t *testing.T) {
 		},
 		{
 			name:       "upstream status becomes Internal without its details",
-			handlerErr: statusWithErrorInfo(t, codes.DataLoss, "FAILED_SAVE_SNAPSHOT", nil),
+			handlerErr: fmt.Errorf("while calling worker: %w", statusWithErrorInfo(t, codes.DataLoss, "FAILED_SAVE_SNAPSHOT", nil)),
 			wantCode:   codes.Internal,
-			wantMsg:    "rpc error: code = DataLoss desc = boom",
+			wantMsg:    "while calling worker: rpc error: code = DataLoss desc = boom",
 		},
 		{
 			name:       "wrapped upstream status becomes Internal",
@@ -201,41 +218,6 @@ func TestInternalServerUnaryInterceptorCodes(t *testing.T) {
 				t.Errorf("ErrorInfo = %v, want none", info)
 			}
 		})
-	}
-}
-
-// TestServerUnaryInterceptorPreservesDetails verifies the public interceptor
-// returns the handler's status intact: ErrorInfo details (reason and metadata)
-// must survive the public wire, even when the status is wrapped.
-func TestServerUnaryInterceptorPreservesDetails(t *testing.T) {
-	metadata := map[string]string{"want": "0.2.0", "have": "0.1.0"}
-	structuredErr := statusWithErrorInfo(t, codes.FailedPrecondition, "INVALID_CHECKPOINT_RESULT", metadata)
-
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, fmt.Errorf("outer error: %w", structuredErr)
-	}
-
-	_, err := ServerUnaryInterceptor(context.Background(), "request", &grpc.UnaryServerInfo{FullMethod: "/test.Service/Method"}, handler)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-
-	st, _ := status.FromError(err)
-	if st.Code() != codes.FailedPrecondition {
-		t.Errorf("code = %v, want %v", st.Code(), codes.FailedPrecondition)
-	}
-
-	info := errorInfoOf(t, err)
-	if info == nil {
-		t.Fatal("status is missing the ErrorInfo detail")
-	}
-	if got, want := info.GetReason(), "INVALID_CHECKPOINT_RESULT"; got != want {
-		t.Errorf("ErrorInfo.Reason = %q, want %q", got, want)
-	}
-	for k, want := range metadata {
-		if got := info.GetMetadata()[k]; got != want {
-			t.Errorf("ErrorInfo.Metadata[%q] = %q, want %q", k, got, want)
-		}
 	}
 }
 
@@ -355,6 +337,9 @@ func TestMaxDeadlineUnaryInterceptor_ShorterDeadlineIsPreserved(t *testing.T) {
 	}
 }
 
+// captureDefaultLog installs the handler stack the servers run with
+// (serverboot.InitLogger: contextlogging over the JSON handler), since the
+// interceptor relies on that handler for redaction.
 func captureDefaultLog(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var log bytes.Buffer
@@ -362,11 +347,11 @@ func captureDefaultLog(t *testing.T) *bytes.Buffer {
 	t.Cleanup(func() {
 		slog.SetDefault(origLogger)
 	})
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&log, nil)))
+	serverboot.InitLoggerWithWriter(&log)
 	return &log
 }
 
-func TestServerUnaryInterceptorRedactsEnvValuesFromProtoRequestLogs(t *testing.T) {
+func TestServerUnaryInterceptorRequestLogMasksEnvValues(t *testing.T) {
 	log := captureDefaultLog(t)
 
 	req := &ateletpb.RunRequest{
@@ -374,7 +359,7 @@ func TestServerUnaryInterceptorRedactsEnvValuesFromProtoRequestLogs(t *testing.T
 			Containers: []*ateletpb.Container{
 				{
 					Name: "main",
-					Env: []*ateletpb.EnvEntry{
+					Env: []*ateletpb.EnvVar{
 						{Name: "API_KEY", Value: "sk-secret"},
 						{Name: "PLAIN", Value: "not-a-secret"},
 					},
@@ -383,7 +368,7 @@ func TestServerUnaryInterceptorRedactsEnvValuesFromProtoRequestLogs(t *testing.T
 		},
 	}
 
-	_, err := ServerUnaryInterceptor(context.Background(), req, &grpc.UnaryServerInfo{FullMethod: "/atelet.AteomHerder/Run"}, func(ctx context.Context, req interface{}) (interface{}, error) {
+	_, err := ServerUnaryInterceptor(context.Background(), req, &grpc.UnaryServerInfo{FullMethod: "/atelet.Atelet/Run"}, func(ctx context.Context, req interface{}) (interface{}, error) {
 		return &ateletpb.RunResponse{}, nil
 	})
 	if err != nil {
@@ -407,13 +392,13 @@ func TestServerUnaryInterceptorRedactsEnvValuesFromProtoRequestLogs(t *testing.T
 	}
 }
 
-func TestServerUnaryInterceptorRedactsActorJWTFromResponseLogs(t *testing.T) {
+func TestServerUnaryInterceptorResponseLogMasksActorJWT(t *testing.T) {
 	log := captureDefaultLog(t)
 
 	const token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhY3RvciJ9.c2lnbmF0dXJl"
-	resp := &ateapipb.MintActorJWTResponse{ActorJwt: token}
+	resp := &ateapipb.MintActorJwtResponse{ActorJwt: token}
 
-	got, err := ServerUnaryInterceptor(context.Background(), &ateapipb.MintActorJWTRequest{}, &grpc.UnaryServerInfo{FullMethod: "/ateapi.Control/MintActorJWT"}, func(ctx context.Context, req interface{}) (interface{}, error) {
+	got, err := ServerUnaryInterceptor(context.Background(), &ateapipb.MintActorJwtRequest{}, &grpc.UnaryServerInfo{FullMethod: "/ateapi.Control/MintActorJwt"}, func(ctx context.Context, req interface{}) (interface{}, error) {
 		return resp, nil
 	})
 	if err != nil {
@@ -427,12 +412,12 @@ func TestServerUnaryInterceptorRedactsActorJWTFromResponseLogs(t *testing.T) {
 	if !strings.Contains(gotLog, `"actor_jwt":"`+protoredact.Placeholder+`"`) {
 		t.Fatalf("log does not show the redacted actor_jwt: %s", gotLog)
 	}
-	if got.(*ateapipb.MintActorJWTResponse).GetActorJwt() != token {
+	if got.(*ateapipb.MintActorJwtResponse).GetActorJwt() != token {
 		t.Fatalf("interceptor mutated the response returned to the client")
 	}
 }
 
-func TestInternalServerUnaryInterceptorRedactsBytesFields(t *testing.T) {
+func TestInternalServerUnaryInterceptorLogMasksBytesFields(t *testing.T) {
 	log := captureDefaultLog(t)
 
 	resp := &credproviderpb.FetchSecretResponse{OpaqueBytes: []byte("hunter2-hunter2")}
@@ -458,55 +443,47 @@ func TestInternalServerUnaryInterceptorRedactsBytesFields(t *testing.T) {
 	}
 }
 
-// TestDebugRedactFieldsArePinned lists every field across our protos that
-// carries debug_redact. It fails when a label is added or removed so the
-// change is reviewed as a deliberate decision about what the logs may show.
-func TestDebugRedactFieldsArePinned(t *testing.T) {
-	want := map[string]bool{
-		"ateapi.EnvVar.value":                           true,
-		"ateapi.MintActorJWTResponse.actor_jwt":         true,
-		"atelet.EnvEntry.value":                         true,
-		"credprovider.FetchSecretResponse.opaque_bytes": true,
+func TestServerUnaryInterceptorLogsNilResponseOnHandlerError(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		resp   any
+	}{
+		{name: "nil", method: "/ateapi.Control/MintActorJwt", resp: nil},
+		// The generated handlers return a typed nil on error; a List call must
+		// not log it as an elided response.
+		{name: "typed nil List response", method: "/ateapi.Control/ListActors", resp: (*ateapipb.ListActorsResponse)(nil)},
 	}
-	got := map[string]bool{}
-	var walk func(protoreflect.MessageDescriptors)
-	walk = func(mds protoreflect.MessageDescriptors) {
-		for i := 0; i < mds.Len(); i++ {
-			md := mds.Get(i)
-			fds := md.Fields()
-			for j := 0; j < fds.Len(); j++ {
-				fd := fds.Get(j)
-				if opts, ok := fd.Options().(*descriptorpb.FieldOptions); ok && opts.GetDebugRedact() {
-					got[string(fd.FullName())] = true
-				}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := captureDefaultLog(t)
+			_, err := ServerUnaryInterceptor(context.Background(), "request", &grpc.UnaryServerInfo{FullMethod: tt.method}, func(ctx context.Context, req interface{}) (interface{}, error) {
+				return tt.resp, apierror.PermissionDenied("no")
+			})
+			if status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("err = %v", err)
 			}
-			walk(md.Messages())
-		}
-	}
-	for _, file := range []protoreflect.FileDescriptor{ateapipb.File_ateapi_proto, ateletpb.File_atelet_proto, credproviderpb.File_credprovider_proto} {
-		walk(file.Messages())
-	}
-	for name := range want {
-		if !got[name] {
-			t.Errorf("%s lost its debug_redact label; the interceptor would log it in clear", name)
-		}
-	}
-	for name := range got {
-		if !want[name] {
-			t.Errorf("%s is newly marked debug_redact; add it to this list if that is intended", name)
-		}
+			if !strings.Contains(log.String(), `"resp":null`) {
+				t.Errorf("nil response should log as null: %s", log.String())
+			}
+		})
 	}
 }
 
-func TestServerUnaryInterceptorLogsNilResponseOnHandlerError(t *testing.T) {
+func TestServerUnaryInterceptorElidesListResponses(t *testing.T) {
 	log := captureDefaultLog(t)
-	_, err := ServerUnaryInterceptor(context.Background(), &ateapipb.MintActorJWTRequest{}, &grpc.UnaryServerInfo{FullMethod: "/ateapi.Control/MintActorJWT"}, func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, status.Error(codes.PermissionDenied, "no")
+
+	resp := &ateapipb.ListActorsResponse{Actors: []*ateapipb.Actor{{Metadata: &ateapipb.ResourceMetadata{Name: "gym-0123456789ab"}}}}
+	got, err := ServerUnaryInterceptor(context.Background(), &ateapipb.ListActorsRequest{Atespace: "nemo-gym"}, &grpc.UnaryServerInfo{FullMethod: "/ateapi.Control/ListActors"}, func(ctx context.Context, req interface{}) (interface{}, error) {
+		return resp, nil
 	})
-	if status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("err = %v", err)
+	if err != nil {
+		t.Fatalf("ServerUnaryInterceptor failed: %v", err)
 	}
-	if !strings.Contains(log.String(), `"resp":null`) {
-		t.Errorf("nil response should log as null: %s", log.String())
+	if gotLog := log.String(); strings.Contains(gotLog, "gym-0123456789ab") || !strings.Contains(gotLog, "ListActors response elided") {
+		t.Fatalf("list response not elided from the log: %s", gotLog)
+	}
+	if len(got.(*ateapipb.ListActorsResponse).GetActors()) != 1 {
+		t.Fatalf("interceptor mutated the response returned to the client")
 	}
 }

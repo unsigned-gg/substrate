@@ -2,13 +2,21 @@
 
 Substrate integrates with the **Container Storage Interface (CSI)** to provide dynamically provisioned, per-actor external volumes that seamlessly attach and detach as actors transition through their lifecycle.
 
+External volumes are a preview feature. The ate API server accepts them only
+when it runs with `--preview=ExternalVolumes` (ate-setup's `preview` setting)
+and the client opts in to preview features: `kubectl ate --preview`, or the
+`Ate-Preview-Allowed: true` gRPC metadata header. The opt-in is needed to
+create an actor template with external volumes, or an actor from such a
+template. Later operations on that actor, such as resume, suspend and delete,
+do not need it.
+
 ---
 
 ## 1. CSI in Substrate vs. Standard Kubernetes
 
 In Kubernetes, volumes are reconciled asynchronously via standard Kubernetes objects (e.g. `PersistentVolumeClaim`, `PersistentVolume`). Agent Substrate takes a different approach tailored for actor lifecycle operations:
 
-* **No PV or PVC Objects:** External volumes are declaratively defined in the [`ActorTemplate`](api-guide.md#2-actortemplate-the-workload-blueprint) via `externalVolumeTemplate` and provisioned dynamically for each actor instance. Volume operations are coupled directly with the actor lifecycle.
+* **No PV or PVC Objects:** External volumes are declaratively defined in the [`ActorTemplate`](api-guide.md#2-actortemplate-the-workload-blueprint) via `external.template` and provisioned dynamically for each actor instance. Volume operations are coupled directly with the actor lifecycle.
 * **Direct Network-Based CSI Controller:** The Substrate control plane (`ateapi`) communicates directly with the CSI Controller gRPC service over the network (via TCP or DNS endpoints, optionally secured with TLS/mTLS).
 
 ---
@@ -33,7 +41,7 @@ spec:
   tls:
     enabled: true
     usePodIdentity: true
-    serverName: csi-nfs-controller.kube-system.svc.cluster.local
+    serverName: csi-nfs-controller.kube-system.svc
 ```
 
 ### Specification (`CSIDriverConfigSpec`)
@@ -51,7 +59,7 @@ spec:
 | :--- | :--- | :--- |
 | `enabled` | `bool` | **Required.** Enables TLS/mTLS for the gRPC connection. |
 | `usePodIdentity` | `bool` | **Optional.** When `true`, reuses Substrate's SPIFFE Pod Identity certificates for mutual TLS (mTLS) with dynamic CA trust bundle verification and rotation. Must be `true` when `enabled` is `true`. |
-| `serverName` | `string` | **Optional.** Server name override for TLS certificate verification. |
+| `serverName` | `string` | **Required.** Expected server name (SAN) for TLS certificate verification when TLS is enabled. |
 
 > [!NOTE]
 > For details on exposing CSI controller endpoints over the network and configuring CSI node DaemonSets with required mount propagations, see the [CSI Driver Deployment Guide](csi-deployment.md).
@@ -66,7 +74,7 @@ External volumes are declared on the `ActorTemplate` resource. For complete deta
 
 To attach a CSI volume to an actor:
 
-1. Define the volume under `volumes` with an `externalVolumeTemplate`.
+1. Define the volume under `volumes` with an `external.template`.
 2. Mount the volume inside one or more containers under `containers[].volumeMounts`.
 
 #### `volumes[]`
@@ -74,14 +82,15 @@ To attach a CSI volume to an actor:
 ```yaml
 volumes:
 - name: my-data-volume
-  externalVolumeTemplate:
-    capacity: 10Gi
-    storageClassName: standard-rwx
+  external:
+    template:
+      capacityBytes: 10737418240 # 10Gi
+      storageClassName: standard-rwx
 ```
 
 * `name`: Unique DNS-label-compliant volume name.
-* `externalVolumeTemplate.capacity`: Quantity string representing the requested volume size (e.g. `1Gi`, `50Gi`).
-* `externalVolumeTemplate.storageClassName`: Name of a Kubernetes `StorageClass` present in the cluster whose `provisioner` matches a registered `CSIDriverConfig`.
+* `external.template.capacityBytes`: The requested volume size in bytes (e.g. `1073741824` for 1Gi).
+* `external.template.storageClassName`: Name of a Kubernetes `StorageClass` present in the cluster whose `provisioner` matches a registered `CSIDriverConfig`.
 
 #### `containers[].volumeMounts[]`
 
@@ -134,7 +143,7 @@ spec:
   tls:
     enabled: true
     usePodIdentity: true
-    serverName: csi-nfs-controller.kube-system.svc.cluster.local
+    serverName: csi-nfs-controller.kube-system.svc
 ```
 
 ### Step 3: Define WorkerPool and ActorTemplate
@@ -153,11 +162,13 @@ metadata:
     workload: stateful-agent
 spec:
   replicas: 5
-  workerImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-gvisor
+  sandboxClasses:
+  - name: gvisor
 ```
 
 The `ActorTemplate` is a protojson-shaped `ateapipb.ActorTemplate`, created
-through the ate API with `kubectl ate create actor-template -f -` (the
+through the ate API with `kubectl ate --preview create actor-template -f -` (the
 `ate-demo` atespace must exist):
 
 ```yaml
@@ -177,14 +188,16 @@ containers:
     httpGet:
       path: /readyz
       port: 8080
-sandboxConfig:
-  sandboxClass: SANDBOX_CLASS_GVISOR
-  configName: gvisor-default
+resources:
+  limits:
+    cpuMillicores: 1000
+    memoryBytes: 1073741824 # 1Gi
 snapshotConfig:
   storageLocation: gs://my-snapshots-bucket/stateful-agent
 volumes:
 - name: shared-storage
-  externalVolumeTemplate:
-    capacity: 5Gi
-    storageClassName: csi-nfs-sc
+  external:
+    template:
+      capacityBytes: 5368709120 # 5Gi
+      storageClassName: csi-nfs-sc
 ```

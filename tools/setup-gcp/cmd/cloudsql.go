@@ -294,25 +294,15 @@ func createCloudSQLGSA(ctx context.Context, cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("get service account iam policy: %w", err)
 	}
-	const wiRole = "roles/iam.workloadIdentityUser"
-	for _, b := range policy.Bindings {
-		if b.Role == wiRole {
-			for _, m := range b.Members {
-				if m == member {
-					slog.Info("Workload Identity binding exists. Skipping.")
-					return nil
-				}
-			}
-			b.Members = append(b.Members, member)
-			return setGSAPolicy(ctx, svc, resource, policy)
-		}
+	if !addServiceAccountBinding(policy, "roles/iam.workloadIdentityUser", member) {
+		slog.Info("Workload Identity binding exists. Skipping.")
+		return nil
 	}
-	policy.Bindings = append(policy.Bindings, &iam.Binding{Role: wiRole, Members: []string{member}})
+	slog.Info("Binding Workload Identity user to service account...")
 	return setGSAPolicy(ctx, svc, resource, policy)
 }
 
 func setGSAPolicy(ctx context.Context, svc *iam.Service, resource string, policy *iam.Policy) error {
-	slog.Info("Binding Workload Identity user to service account...")
 	_, err := svc.Projects.ServiceAccounts.SetIamPolicy(resource, &iam.SetIamPolicyRequest{Policy: policy}).Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("set service account iam policy: %w", err)
@@ -395,24 +385,21 @@ func createCloudSQLIAMUser(ctx context.Context, svc *sqladmin.Service, cfg *Conf
 
 func printCloudSQLNextSteps(cfg *Config) {
 	gsa := cloudSQLGSAEmail(cfg)
-	dbUser := cloudSQLDatabaseUser(gsa)
 	fmt.Printf(`
 Cloud SQL is provisioned. Two steps remain:
 
-1. One-time schema privileges (PostgreSQL 15+ removed PUBLIC's CREATE on the
-   public schema; ateapi applies its schema at startup as the IAM user).
-   Connect as the postgres user and run:
-
-     GRANT USAGE, CREATE ON SCHEMA public TO "%s";
+1. Create the PostgreSQL owner and read/write roles, grant the IAM database
+   user membership, and configure schema privileges. Follow section 2 of
+   tools/setup-gcp/cloud-sql.md before deploying ateapi.
 
 2. Deploy ateapi against it:
 
      export ATE_API_POSTGRES_CLOUDSQL_INSTANCE=%s:%s:%s
      export ATE_API_POSTGRES_CLOUDSQL_GSA=%s
-     ./hack/install-ate.sh --deploy-ate-system
+     ./hack/install-ate.sh --deploy-ate-system --credential-provider='{"name":"k8s.io"}'
 
 See tools/setup-gcp/cloud-sql.md for details and verification steps.
-`, dbUser, cfg.ProjectID, cfg.Region, cfg.CloudSQLInstance, gsa)
+`, cfg.ProjectID, cfg.Region, cfg.CloudSQLInstance, gsa)
 }
 
 var cloudsqlCmd = &cobra.Command{
@@ -443,6 +430,11 @@ var cloudsqlCmd = &cobra.Command{
 		if err := createCloudSQLGSA(ctx, &cfg); err != nil {
 			return err
 		}
+		// ate-api-server's pod runs as this account once Cloud SQL is on, so
+		// its credential exchange creates transfer account tokens with it.
+		if err := setupTransferServiceAccount(ctx, &cfg, "serviceAccount:"+cloudSQLGSAEmail(&cfg)); err != nil {
+			return err
+		}
 		if err := grantCloudSQLProjectRoles(ctx, &cfg); err != nil {
 			return err
 		}
@@ -461,5 +453,6 @@ func init() {
 	cloudsqlCmd.Flags().StringVar(&cfg.CloudSQLEdition, "edition", getEnv("CLOUDSQL_EDITION", "enterprise"), "Instance edition: enterprise | enterprise-plus (enables the local-SSD data cache) [env: CLOUDSQL_EDITION]")
 	cloudsqlCmd.Flags().Int64Var(&cfg.CloudSQLStorageGB, "storage-size", getEnv("CLOUDSQL_STORAGE_GB", int64(0)), "Data disk size in GB; 0 = Cloud SQL default (10 GB, auto-resizing). PD IOPS scale with size [env: CLOUDSQL_STORAGE_GB]")
 	cloudsqlCmd.Flags().StringVar(&cfg.CloudSQLGSAName, "gsa-name", getEnv("CLOUDSQL_GSA_NAME", "ate-api-server"), "Name of the Google service account to create for Workload Identity + IAM database auth [env: CLOUDSQL_GSA_NAME]")
+	addTransferGSANameFlag(cloudsqlCmd)
 	cloudsqlCmd.Flags().StringVar(&cfg.Network, "network", getEnv("NETWORK", "default"), "VPC network name (must match the cluster's) [env: NETWORK]")
 }

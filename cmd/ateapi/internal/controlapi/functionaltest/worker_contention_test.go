@@ -23,8 +23,10 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/hardware"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	"google.golang.org/protobuf/proto"
 )
 
 // TestResumeActor_ConcurrentOntoOneWorker is the regression test for a refusal
@@ -130,7 +132,7 @@ func TestResumeActor_ConcurrentOntoOneWorker(t *testing.T) {
 
 // setWorkerActorCapacity raises the actors ceiling on every Worker in the pool.
 //
-// The ceiling is the Worker's, reported by its ateom, so a test that wants more
+// The ceiling is the Worker's, reported by its worker, so a test that wants more
 // than the unset default of one writes it where the reporter would. Waits for
 // the scheduler's cache to see it, since placement reads that and not the store.
 func setWorkerActorCapacity(t *testing.T, tc *testContext, pool string, actors int32) {
@@ -152,9 +154,47 @@ func setWorkerActorCapacity(t *testing.T, tc *testContext, pool string, actors i
 	}
 }
 
-// reportWorkerCapacity stands in for the ateom's capacity report, which atelet
-// forwards to WorkerService in a real cluster. It waits for the worker cache,
-// which placement reads, to catch up.
+// reportedEpoch is the epoch reportWorkerCapacity registers, and the one the
+// fake atelet reports its workloads ran under.
+const reportedEpoch = 1
+
+// defaultWorkerRuntime returns the default ActorSandboxRuntime that
+// reportWorkerCapacity records on a test worker of the given sandbox class.
+func defaultWorkerRuntime(class string) *ateapipb.ActorSandboxRuntime {
+	if class == "" {
+		class = "gvisor"
+	}
+	return &ateapipb.ActorSandboxRuntime{
+		SandboxClass: class,
+		Version: &ateapipb.VersionedSandboxCompat{
+			SchemaVersion: hardware.SchemaVersionV1,
+			Attributes: []*ateapipb.AttributeEntry{
+				{Key: hardware.AttrArchitecture, Value: "amd64"},
+				{Key: hardware.AttrSandboxBundleHash, Value: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+			},
+		},
+	}
+}
+
+// workerSandboxClasses is the sandbox_classes a worker reports to run def as
+// its default runtime and restore restorable beyond it, all of def's class.
+// The arguments are the ActorSandboxRuntimes a test also expects on snapshots and
+// assignments, so both sides of a match derive from one value; the compats
+// are copied so the stored row never aliases them.
+func workerSandboxClasses(def *ateapipb.ActorSandboxRuntime, restorable ...*ateapipb.ActorSandboxRuntime) []*ateapipb.WorkerSandboxClass {
+	class := &ateapipb.WorkerSandboxClass{SandboxClass: def.GetSandboxClass(), DefaultRuntime: &ateapipb.WorkerSandboxRuntime{Version: proto.CloneOf(def.GetVersion())}}
+	for _, r := range restorable {
+		class.RestorableRuntimes = append(class.RestorableRuntimes, &ateapipb.WorkerSandboxRuntime{Version: proto.CloneOf(r.GetVersion())})
+	}
+	return []*ateapipb.WorkerSandboxClass{class}
+}
+
+// reportWorkerCapacity stands in for the worker process's registration and
+// runtimes report, which atelet forwards to WorkerService in a real cluster,
+// with compute for actors of the size test templates declare. A Worker not yet
+// registered gets reportedEpoch, an IP and a default runtime; one already
+// registered keeps them. It waits for the worker cache, which placement reads,
+// to catch up.
 func reportWorkerCapacity(t *testing.T, tc *testContext, name string, actors int32) {
 	t.Helper()
 	ctx := context.Background()
@@ -163,7 +203,17 @@ func reportWorkerCapacity(t *testing.T, tc *testContext, name string, actors int
 		t.Fatalf("getting worker %s: %v", name, err)
 	}
 	if _, err := tc.persistence.UpdateWorker(ctx, name, store.PreconditionFrom(worker), func(toUpdate *ateapipb.Worker) error {
-		toUpdate.Status.Capacity = &ateapipb.WorkerResources{Actors: actors}
+		if toUpdate.Status.RegisteredEpoch == 0 {
+			toUpdate.Status.RegisteredEpoch = reportedEpoch
+			toUpdate.Status.Ips = []string{"127.0.0.1"}
+		}
+		toUpdate.Status.Capacity = &ateapipb.WorkerResources{
+			Actors:        actors,
+			CpuMillicores: int64(actors) * 1000, MemoryBytes: int64(actors) * 512 << 20,
+		}
+		if len(toUpdate.Status.SandboxClasses) == 0 {
+			toUpdate.Status.SandboxClasses = workerSandboxClasses(defaultWorkerRuntime("gvisor"))
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("setting capacity on worker %s: %v", name, err)

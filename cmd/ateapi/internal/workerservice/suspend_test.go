@@ -20,14 +20,13 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/testing/protocmp"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/ateletauth/ateletauthtest"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/cmd/ateapi/internal/ateletauth/ateletauthtest"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 )
 
 const (
@@ -37,7 +36,7 @@ const (
 
 // seedHostedActor stores an actor assigned to workerName, as the placement
 // path leaves one that is RUNNING. An empty workerName seeds an actor with no
-// assignment at all, which is how a SUSPENDED, PAUSED, or CRASHED one looks.
+// assignment at all, which is how a SUSPENDED or CRASHED one looks.
 func seedHostedActor(t *testing.T, st store.Interface, workerName string) *ateapipb.Actor {
 	t.Helper()
 	actorStatus := &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED}
@@ -78,8 +77,8 @@ func TestRequestActorSuspend(t *testing.T) {
 		Metadata: actor.GetMetadata(),
 		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
 	}
-	suspender := &fakeSuspender{resp: &ateapipb.SuspendActorResponse{Actor: suspended}}
-	s := New(st, suspender, testAteletSPIFFEID, nil)
+	control := &fakeControl{resp: &ateapipb.SuspendActorResponse{Actor: suspended}}
+	s := New(st, control, testAteletSPIFFEID, nil, "", nil)
 
 	got, err := s.RequestActorSuspend(
 		ateletauthtest.ContextWith(ateletauthtest.CertOn(t, testNode)),
@@ -90,10 +89,10 @@ func TestRequestActorSuspend(t *testing.T) {
 	want := []*ateapipb.SuspendActorRequest{{
 		Actor: &ateapipb.ObjectRef{Atespace: suspendAtespace, Name: suspendActor},
 	}}
-	if diff := cmp.Diff(want, suspender.calls, protocmp.Transform()); diff != "" {
+	if diff := cmp.Diff(want, control.calls, protocmp.Transform()); diff != "" {
 		t.Errorf("suspend calls mismatch (-want +got):\n%s", diff)
 	}
-	// The caller gets the actor as the workflow left it, so an ateom can see
+	// The caller gets the actor as the workflow left it, so a worker can see
 	// whether the suspend it asked for actually happened.
 	if diff := cmp.Diff(suspended, got.GetActor(), protocmp.Transform()); diff != "" {
 		t.Errorf("returned actor mismatch (-want +got):\n%s", diff)
@@ -126,8 +125,8 @@ func TestRequestActorSuspend_OnlyForHostedActors(t *testing.T) {
 			defer cleanup()
 			seedReportedWorker(t, st, testNode, &ateapipb.WorkerResources{Actors: 1})
 			actor := seedHostedActor(t, st, tc.assignedWorker)
-			suspender := &fakeSuspender{}
-			s := New(st, suspender, testAteletSPIFFEID, nil)
+			control := &fakeControl{}
+			s := New(st, control, testAteletSPIFFEID, nil, "", nil)
 
 			uid := tc.requestedUID
 			if uid == "" {
@@ -136,11 +135,11 @@ func TestRequestActorSuspend_OnlyForHostedActors(t *testing.T) {
 			_, err := s.RequestActorSuspend(
 				ateletauthtest.ContextWith(ateletauthtest.CertOn(t, tc.callerNode)),
 				suspendRequest(uid))
-			if got := status.Code(err); got != codes.NotFound {
+			if got := apierror.Code(err); got != codes.NotFound {
 				t.Fatalf("code = %v (err %v), want NotFound", got, err)
 			}
-			if len(suspender.calls) != 0 {
-				t.Errorf("refused request still reached the suspend: %v", suspender.calls)
+			if len(control.calls) != 0 {
+				t.Errorf("refused request still reached the suspend: %v", control.calls)
 			}
 		})
 	}
@@ -152,8 +151,8 @@ func TestRequestActorSuspend_Errors(t *testing.T) {
 	seedReportedWorker(t, st, testNode, &ateapipb.WorkerResources{Actors: 1})
 	actor := seedHostedActor(t, st, testWorkerName)
 	uid := actor.GetMetadata().GetUid()
-	suspender := &fakeSuspender{}
-	s := New(st, suspender, testAteletSPIFFEID, nil)
+	control := &fakeControl{}
+	s := New(st, control, testAteletSPIFFEID, nil, "", nil)
 	authed := ateletauthtest.ContextWith(ateletauthtest.CertOn(t, testNode))
 
 	tests := []struct {
@@ -199,73 +198,31 @@ func TestRequestActorSuspend_Errors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := s.RequestActorSuspend(tc.ctx, tc.req)
-			if got := status.Code(err); got != tc.want {
+			if got := apierror.Code(err); got != tc.want {
 				t.Errorf("code = %v (err %v), want %v", got, err, tc.want)
 			}
 		})
 	}
-	if len(suspender.calls) != 0 {
-		t.Errorf("a malformed or unauthorized request reached the suspend: %v", suspender.calls)
-	}
-}
-
-// A golden actor is committed by the template controller once the warmup it
-// timed has elapsed, and the suspend is that commit. The actor idles from the
-// moment it boots, so it would ask immediately and snapshot a workload that
-// never warmed up. Control.SuspendActor still serves the controller; only the
-// Worker's request for one is refused.
-func TestRequestActorSuspend_GoldenActorCannotSelfSuspend(t *testing.T) {
-	st, cleanup := storetest.SetupTestStore(t)
-	defer cleanup()
-	seedReportedWorker(t, st, testNode, &ateapipb.WorkerResources{Actors: 1})
-	golden := storetest.MustCreateActor(t, context.Background(), st, &ateapipb.Actor{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: resources.GoldenActorAtespace, Name: suspendActor},
-		Status: &ateapipb.ActorStatus{
-			State: ateapipb.ActorState_ACTOR_STATE_RUNNING,
-			WorkerAssignment: &ateapipb.WorkerAssignment{
-				Worker:          &ateapipb.ObjectRef{Name: testWorkerName},
-				WorkerNamespace: "ate-system",
-				WorkerPool:      "pool-1",
-				WorkerPod:       "worker-pod-1",
-				WorkerPodUid:    testWorkerName,
-			},
-		},
-	})
-	suspender := &fakeSuspender{}
-	s := New(st, suspender, testAteletSPIFFEID, nil)
-
-	// Everything else about the request is in order: the Worker really does
-	// host this actor, so being golden is the only reason it is refused.
-	_, err := s.RequestActorSuspend(
-		ateletauthtest.ContextWith(ateletauthtest.CertOn(t, testNode)),
-		&ateapipb.RequestActorSuspendRequest{
-			Worker:   &ateapipb.ObjectRef{Name: testWorkerName},
-			Actor:    &ateapipb.ObjectRef{Atespace: resources.GoldenActorAtespace, Name: suspendActor},
-			ActorUid: golden.GetMetadata().GetUid(),
-		})
-	if got := status.Code(err); got != codes.FailedPrecondition {
-		t.Fatalf("code = %v (err %v), want FailedPrecondition", got, err)
-	}
-	if len(suspender.calls) != 0 {
-		t.Errorf("golden actor request still reached the suspend: %v", suspender.calls)
+	if len(control.calls) != 0 {
+		t.Errorf("a malformed or unauthorized request reached the suspend: %v", control.calls)
 	}
 }
 
 // The suspend is a proposal, and the control plane's refusal is the answer: a
-// request that loses a race to a resume, pause, or delete comes back as what
+// request that loses a race to a resume, suspend, or delete comes back as what
 // the workflow said, not as something the worker has to interpret.
 func TestRequestActorSuspend_PassesThroughTheWorkflowsRefusal(t *testing.T) {
 	st, cleanup := storetest.SetupTestStore(t)
 	defer cleanup()
 	seedReportedWorker(t, st, testNode, &ateapipb.WorkerResources{Actors: 1})
 	actor := seedHostedActor(t, st, testWorkerName)
-	suspender := &fakeSuspender{err: status.Error(codes.FailedPrecondition, "Actor is RESUMING")}
-	s := New(st, suspender, testAteletSPIFFEID, nil)
+	control := &fakeControl{err: apierror.FailedPrecondition("Actor is RESUMING")}
+	s := New(st, control, testAteletSPIFFEID, nil, "", nil)
 
 	_, err := s.RequestActorSuspend(
 		ateletauthtest.ContextWith(ateletauthtest.CertOn(t, testNode)),
 		suspendRequest(actor.GetMetadata().GetUid()))
-	if got := status.Code(err); got != codes.FailedPrecondition {
+	if got := apierror.Code(err); got != codes.FailedPrecondition {
 		t.Fatalf("code = %v (err %v), want FailedPrecondition", got, err)
 	}
 }

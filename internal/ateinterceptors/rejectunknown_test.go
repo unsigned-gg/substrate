@@ -20,13 +20,13 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 )
 
 // unknownField encodes a varint field that no descriptor in this binary
@@ -127,13 +127,13 @@ func TestFindUnknownFields(t *testing.T) {
 		{
 			name: "unknown field inside a map value message",
 			in: func() proto.Message {
-				return &ateletpb.SandboxAssets{
-					Assets: map[string]*ateletpb.ArchAssets{
-						"amd64": withUnknown(&ateletpb.ArchAssets{}, 9999),
+				return &structpb.Struct{
+					Fields: map[string]*structpb.Value{
+						"amd64": withUnknown(&structpb.Value{}, 9999),
 					},
 				}
 			},
-			want: field.ErrorList{field.Invalid(field.NewPath("assets").Key("amd64"), field.OmitValueType{}, "")},
+			want: field.ErrorList{field.Invalid(field.NewPath("fields").Key("amd64"), field.OmitValueType{}, "")},
 		},
 		{
 			name: "scalar map values cannot carry unknown fields",
@@ -176,10 +176,10 @@ func TestRejectUnknownFieldsUnaryInterceptor(t *testing.T) {
 				called = true
 				return nil, nil
 			})
-		if got, want := status.Code(err), codes.InvalidArgument; got != want {
+		if got, want := apierror.Code(err), codes.InvalidArgument; got != want {
 			t.Fatalf("status code = %v, want %v (error: %v)", got, want, err)
 		}
-		if got, want := status.Convert(err).Message(), "request: Invalid value: unknown field with protobuf tag 9999"; got != want {
+		if got, want := err.Error(), "request: Invalid value: unknown field with protobuf tag 9999"; got != want {
 			t.Errorf("error message = %q, want %q", got, want)
 		}
 		if called {

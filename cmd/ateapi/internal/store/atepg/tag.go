@@ -19,10 +19,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/jackc/pgx/v5"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -185,6 +185,22 @@ func (p *Persistence) CreateTag(ctx context.Context, tag *ateapipb.Tag) (*ateapi
 	return dbTag, nil
 }
 
+func isAllowedTagSnapshotTransition(stored, mutated *ateapipb.Snapshot) bool {
+	if proto.Equal(stored, mutated) || stored == nil {
+		return true
+	}
+	if mutated == nil || stored.GetDurableSnapshot() == nil || mutated.GetDurableSnapshot() == nil {
+		return false
+	}
+	if stored.GetDurableSnapshot().GetStatus() != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING ||
+		mutated.GetDurableSnapshot().GetStatus() != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED {
+		return false
+	}
+	expected := proto.CloneOf(stored)
+	expected.DurableSnapshot.Status = ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED
+	return proto.Equal(expected, mutated)
+}
+
 func validateUpdateTagMutation(storedTag, mutatedTag *ateapipb.Tag) error {
 	if stored, mutated := storedTag.GetMetadata().GetAtespace(), mutatedTag.GetMetadata().GetAtespace(); stored != mutated {
 		return fmt.Errorf("metadata.atespace is immutable: mutation changed it from %q to %q", stored, mutated)
@@ -192,11 +208,8 @@ func validateUpdateTagMutation(storedTag, mutatedTag *ateapipb.Tag) error {
 	if stored, mutated := storedTag.GetMetadata().GetName(), mutatedTag.GetMetadata().GetName(); stored != mutated {
 		return fmt.Errorf("metadata.name is immutable: mutation changed it from %q to %q", stored, mutated)
 	}
-	if stored, mutated := storedTag.GetStatus().GetSnapshot(), mutatedTag.GetStatus().GetSnapshot(); stored != nil && !proto.Equal(stored, mutated) {
+	if stored, mutated := storedTag.GetStatus().GetSnapshot(), mutatedTag.GetStatus().GetSnapshot(); !isAllowedTagSnapshotTransition(stored, mutated) {
 		return fmt.Errorf("status.snapshot is immutable once set: mutation changed it from %s to %s", stored, mutated)
-	}
-	if stored, mutated := storedTag.GetStatus().GetStorageLocation(), mutatedTag.GetStatus().GetStorageLocation(); stored != mutated {
-		return fmt.Errorf("status.storage_location is immutable: mutation changed it from %q to %q", stored, mutated)
 	}
 	if stored, mutated := storedTag.GetStatus().GetActorTemplateUid(), mutatedTag.GetStatus().GetActorTemplateUid(); stored != mutated {
 		return fmt.Errorf("status.actor_template_uid is immutable: mutation changed it from %q to %q", stored, mutated)
@@ -208,6 +221,14 @@ func (p *Persistence) UpdateTag(ctx context.Context, tagRef resources.TagRef, pr
 	if err := precondition.Validate(); err != nil {
 		return nil, err
 	}
+	return p.updateTag(ctx, tagRef, store.DeletePreconditions(precondition), mutate, false)
+}
+
+func (p *Persistence) MarkTagForDeletion(ctx context.Context, tagRef resources.TagRef, precondition store.DeletePreconditions, mutate func(*ateapipb.Tag) error) (*ateapipb.Tag, error) {
+	return p.updateTag(ctx, tagRef, precondition, mutate, true)
+}
+
+func (p *Persistence) updateTag(ctx context.Context, tagRef resources.TagRef, precondition store.DeletePreconditions, mutate func(*ateapipb.Tag) error, markForDeletion bool) (*ateapipb.Tag, error) {
 	atespace, name := tagRef.Atespace, tagRef.Name
 	var currentUID string
 	var currentVersion int64
@@ -233,8 +254,10 @@ func (p *Persistence) UpdateTag(ctx context.Context, tagRef resources.TagRef, pr
 	}
 	tagBeforeMutation := proto.Clone(dbTag).(*ateapipb.Tag)
 	oldMeta := proto.CloneOf(dbTag.Metadata)
-	if err := mutate(dbTag); err != nil {
-		return nil, err
+	if mutate != nil {
+		if err := mutate(dbTag); err != nil {
+			return nil, err
+		}
 	}
 	// TODO: this should be done through DV and removed from here
 	if err := validateUpdateTagMutation(tagBeforeMutation, dbTag); err != nil {
@@ -243,6 +266,9 @@ func (p *Persistence) UpdateTag(ctx context.Context, tagRef resources.TagRef, pr
 	// Stored metadata is authoritative; discard any metadata edits made by the
 	// closure and derive the next revision from the state this attempt read.
 	setUpdateMetadata(dbTag.Metadata, oldMeta)
+	if markForDeletion && dbTag.Metadata.DeleteTime == nil {
+		dbTag.Metadata.DeleteTime = proto.CloneOf(dbTag.Metadata.UpdateTime)
+	}
 
 	updatedBytes, err := proto.Marshal(dbTag)
 	if err != nil {
