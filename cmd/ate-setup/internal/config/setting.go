@@ -300,6 +300,14 @@ var Registry = []Setting{
 			"use it on a cluster that serves real actors",
 	},
 	{
+		// Repo-relative kustomize component directories, comma-separated. They are
+		// composed into every control plane apply, the full bundle and the
+		// single-component redeploys alike, so one component carries a cluster's
+		// own patches (see manifests/ate-install/components/cygnus).
+		Key: "manifests.components", Env: "ATE_MANIFESTS_COMPONENTS", Flag: "manifests-components", Kind: KindString,
+		Usage: "Comma-separated repo-relative kustomize component directories composed into every control plane apply",
+	},
+	{
 		// Comma-separated, as the router's own flag is. The registry has no
 		// list kind, so the value is carried as written and split where it is
 		// used.

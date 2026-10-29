@@ -1,0 +1,59 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# In-cluster mTLS client for checking the Envoy ingress router. Runs as the
+# allow-listed ate-ingress-client ServiceAccount; the kubelet projects the
+# podidentity certificate and the servicedns trust bundle the router's own
+# certificate chains to. Delete it after the check.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ate-ingress-client
+  namespace: ate-system
+  labels: {app: ate-ingress-client}
+spec:
+  serviceAccountName: ate-ingress-client
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  containers:
+  - name: curl
+    image: docker.io/curlimages/curl:8.11.1
+    command: ["sleep", "3600"]
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 100
+      runAsGroup: 101
+      allowPrivilegeEscalation: false
+      capabilities: {drop: [ALL]}
+      seccompProfile: {type: RuntimeDefault}
+    volumeMounts:
+    - {name: podidentity, mountPath: /run/podidentity, readOnly: true}
+    - {name: servicedns-ca, mountPath: /run/servicedns-ca, readOnly: true}
+  volumes:
+  - name: podidentity
+    projected:
+      sources:
+      - podCertificate:
+          signerName: podidentity.podcert.ate.dev/identity
+          keyType: ECDSAP256
+          credentialBundlePath: credential-bundle.pem
+  - name: servicedns-ca
+    projected:
+      sources:
+      - clusterTrustBundle:
+          signerName: servicedns.podcert.ate.dev/identity
+          labelSelector:
+            matchLabels:
+              podcert.ate.dev/canarying: live
+          path: trust-bundle.pem

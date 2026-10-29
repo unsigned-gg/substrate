@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -1506,5 +1507,23 @@ func TestRemoveFakeWorkersync(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A cluster's own component is composed after the built-in ones, so it sees
+// the control plane as a GKE or kind install would have rendered it.
+func TestComponentsIncludeManifestComponents(t *testing.T) {
+	e := &Env{Cfg: &config.Config{
+		Root:               repoRoot(t),
+		CordonControlPlane: true,
+		ManifestComponents: []string{"manifests/ate-install/components/cygnus"},
+	}}
+	got := e.components()
+	want := []string{e.Cfg.Path(cordonControlPlaneComponent), e.Cfg.Path("manifests/ate-install/components/cygnus")}
+	if !slices.Equal(got, want) {
+		t.Errorf("components() = %v, want %v", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(got[1], "kustomization.yaml")); err != nil {
+		t.Errorf("the cygnus component is missing its kustomization: %v", err)
 	}
 }

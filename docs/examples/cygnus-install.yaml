@@ -1,0 +1,60 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The Cygnus install document (docs/cygnus-install.md). Pass it with --config.
+# Only what differs from the defaults is named; see operator-install.md.
+apiVersion: install.ate.dev/v1alpha1
+kind: SubstrateInstall
+
+namespace: ate-system
+context: cygnus
+clusterSize: size0
+rolloutTimeout: 10m0s
+
+atenet:
+  # Envoy, the v0.6.0 default. The agentgateway build v0.6.0 pins does not
+  # decode the v0.6.0 Actor message (docs/cygnus-install.md, "Dataplane"); to
+  # run it anyway, set agentgateway here and add
+  # manifests/ate-install/components/cygnus-agentgateway to manifests.components.
+  dataplane: envoy
+  egress:
+    # No egress credential injection in the reference install, as the
+    # 2026-10-11 install ran. {"name":"k8s.io"} would add the bundled
+    # Kubernetes Secrets provider (image kubernetes-secrets, to be signed).
+    credentialProvider: '{"enabled":false}'
+
+# The Envoy router accepts only mTLS clients on this allow-list (exact SPIFFE
+# IDs; any listed client may reach any actor). The account is created by
+# manifests/ate-install/cygnus/ingress-client.yaml.
+ingressAllowedSPIFFEIDs: spiffe://cluster.local/ns/ate-system/sa/ate-ingress-client
+images:
+  # Pre-built by `ate-setup publish release-images` from the same checkout.
+  # ate-setup pins each reference to the digest the tag names at install time.
+  repo: harbor.unsigned.gg/platform
+  tag: v0.6.0
+
+storage:
+  # The in-cluster rustfs (manifests/ate-install/cygnus/rustfs), reached over
+  # the S3 API by the objectstore-plugin sidecars. The credentials are in the
+  # ate-objectstore-s3 Secret, never in this file.
+  bucketName: ate-snapshots
+  snapshotLocation: s3://ate-snapshots/
+
+# Grafana Alloy is the cluster's OTLP collector.
+otlpEndpoint: http://alloy-gateway.monitoring.svc.cluster.local:4317
+
+manifests:
+  # Composed into every control plane apply: Harbor pull Secret, S3 storage
+  # settings, Alloy telemetry, no GKE credential provider or Managed Prometheus.
+  components: manifests/ate-install/components/cygnus

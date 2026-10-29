@@ -91,6 +91,16 @@ func TestBuildAuthenticationConfig(t *testing.T) {
 				"  certificateAuthorityFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt\n" +
 				"  discoveryTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token",
 		},
+		{
+			name:   "internal IP issuer projects the service account CA and token",
+			issuer: "https://10.0.0.100:6443",
+			want: "jwtProviders:\n" +
+				"- name: kubernetes\n" +
+				"  issuer: https://10.0.0.100:6443\n" +
+				"  audiences: [api.ate-system.svc]\n" +
+				"  certificateAuthorityFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt\n" +
+				"  discoveryTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := buildAuthenticationConfig(tc.issuer); got != tc.want {
