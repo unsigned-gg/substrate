@@ -23,10 +23,21 @@ clusterSize: size0
 rolloutTimeout: 10m0s
 
 atenet:
-  # atenet-router and atenet-egress run agentgateway, from the Harbor mirror
-  # pinned in manifests/ate-install/components/cygnus.
-  dataplane: agentgateway
+  # Envoy, the v0.6.0 default. The agentgateway build v0.6.0 pins does not
+  # decode the v0.6.0 Actor message (docs/cygnus-install.md, "Dataplane"); to
+  # run it anyway, set agentgateway here and add
+  # manifests/ate-install/components/cygnus-agentgateway to manifests.components.
+  dataplane: envoy
+  egress:
+    # No egress credential injection in the reference install, as the
+    # 2026-10-11 install ran. {"name":"k8s.io"} would add the bundled
+    # Kubernetes Secrets provider (image kubernetes-secrets, to be signed).
+    credentialProvider: '{"enabled":false}'
 
+# The Envoy router accepts only mTLS clients on this allow-list (exact SPIFFE
+# IDs; any listed client may reach any actor). The account is created by
+# manifests/ate-install/cygnus/ingress-client.yaml.
+ingressAllowedSPIFFEIDs: spiffe://cluster.local/ns/ate-system/sa/ate-ingress-client
 images:
   # Pre-built by `ate-setup publish release-images` from the same checkout.
   # ate-setup pins each reference to the digest the tag names at install time.

@@ -12,20 +12,43 @@ What differs from a GKE install, and where each difference lives:
 |---|---|
 | Component images are pre-built into Harbor and pulled with the `harbor-pull` Secret | `docs/examples/cygnus-install.yaml` (`images`), component patch |
 | Snapshots go to an in-cluster rustfs over the S3 API, credentials from a Secret | `manifests/ate-install/cygnus/rustfs`, component patch, `storage.snapshotLocation: s3://…` |
-| Telemetry goes to Alloy | `otlpEndpoint`, component patch for agentgateway |
+| Telemetry goes to Alloy | `otlpEndpoint` (and the `cygnus-agentgateway` component when that dataplane runs) |
+| Envoy ingress accepts one client identity | `ingressAllowedSPIFFEIDs`, `manifests/ate-install/cygnus/ingress-client.yaml` |
 | No kubelet credential provider plugin, no Google Managed Prometheus | component patch |
 | The API server's OIDC issuer is an IP URL (`https://10.0.0.100:6443`) | `ate-setup` projects the ServiceAccount CA and token for private-network issuers |
 | No GCS transfer service account | `ate-setup` skips the requirement for `s3://` locations |
+| Pod Security Standards per namespace, baseline by default | `manifests/ate-install/cygnus/namespace.yaml` makes `ate-system` privileged |
+| No egress credential injection (as the 2026-10-11 install ran) | `atenet.egress.credentialProvider: '{"enabled":false}'` in the install document |
 
 The component is `manifests/ate-install/components/cygnus`. The install document
 names it under `manifests.components`, and `ate-setup` composes it into every
 control plane apply, so a lone `deploy atelet` renders the same patches as the
-full bundle.
+full bundle. `components/cygnus-agentgateway` holds what only the agentgateway
+dataplane needs and is listed only when that dataplane is chosen.
+
+## Dataplane
+
+The reference install runs the Envoy dataplane, the v0.6.0 default. The
+agentgateway build v0.6.0 pins (`v0.0.0-alpha.168b05d6`) was built against an
+older Actor message: it reads `Actor.status` at proto field 7 while the v0.6.0
+`ate-api-server` sends it at field 5, so the router never sees a worker
+assignment and every proxied request fails with HTTP 500 (`ResumeActor
+response did not include a worker assignment`), although the actor itself
+resumes. Upstream re-paired the two after v0.6.0 (agentgateway v1.7.0, #2962)
+together with API changes that v0.6.0 does not have. Choose agentgateway again
+only with a release that pins a build matching its own proto.
+
+Envoy's router has mTLS listeners only (Service ports 443 and 8444) and admits
+the exact SPIFFE IDs in `ingressAllowedSPIFFEIDs`. On Cygnus that is one
+ServiceAccount, `ate-system/ate-ingress-client`; a pod running as it with a
+`podCertificate` projected volume for `podidentity.podcert.ate.dev/identity`
+gets the matching certificate from the kubelet. Any listed client may reach any
+actor, so bind that account only to the workloads that should.
 
 ## Before you start
 
 On the machine running the install: git, go 1.27, ko, docker with buildx (for
-`envoy-dataplane`, built even when agentgateway is the dataplane), crane, cosign,
+`envoy-dataplane`), crane, cosign,
 kubectl, and a kubeconfig whose `cygnus` context is cluster-admin:
 
 ```bash
@@ -54,7 +77,8 @@ go run ./cmd/ate-setup --no-dev-env publish worker-images  --ko-docker-repo harb
 Each line of output is `<binary>: harbor.unsigned.gg/platform/<binary>:v0.6.0@sha256:…`.
 Put the `ateworker-gvisor` digest into `manifests/ate-install/cygnus/workerpool.yaml`.
 
-Mirror agentgateway by digest, to the digest `components/agentgateway` pins:
+Only for the agentgateway dataplane (see "Dataplane"), mirror agentgateway by
+digest, to the digest `components/agentgateway` pins:
 
 ```bash
 crane copy cr.agentgateway.dev/agentgateway:v0.0.0-alpha.168b05d6@sha256:5e8384d1fcfdc443a3ad5155ea6a64dc7953bde162df7f5f8e131a5c19ae08a3 \
@@ -72,9 +96,8 @@ umask 077; d=$(mktemp -d)
 op read 'op://cloud/unsigned-paas-cosign/private-key'      > "$d/cosign.key"
 op read 'op://cloud/unsigned-paas-cosign/password' > "$d/cosign.pw"
 for ref in $(go run ./cmd/ate-setup --no-dev-env publish release-images --ko-docker-repo harbor.unsigned.gg/platform 2>/dev/null | awk '{print $2}') \
-           harbor.unsigned.gg/platform/ateworker-gvisor@sha256:3e97cd95e44462a38f00ef06d5943ae681d9193f920b0e6bcb19e73c80d2c140 \
-           harbor.unsigned.gg/platform/agentgateway@sha256:5e8384d1fcfdc443a3ad5155ea6a64dc7953bde162df7f5f8e131a5c19ae08a3; do
-  COSIGN_PASSWORD="$(cat "$d/cosign.pw")" cosign sign --yes --key "$d/cosign.key" "${ref#*: }"
+           harbor.unsigned.gg/platform/ateworker-gvisor@sha256:3e97cd95e44462a38f00ef06d5943ae681d9193f920b0e6bcb19e73c80d2c140; do
+  COSIGN_PASSWORD="$(cat "$d/cosign.pw")" cosign sign --yes --key "$d/cosign.key" --tlog-upload=false "${ref#*: }"
 done
 shred -u "$d/cosign.key" "$d/cosign.pw"; rmdir "$d"
 ```
@@ -87,12 +110,16 @@ kubectl -n kyverno get secret cosign-public-key -o jsonpath='{.data.cosign\.pub}
 cosign verify --key cosign.pub --insecure-ignore-tlog harbor.unsigned.gg/platform/ateapi:v0.6.0 >/dev/null && echo signed
 ```
 
+The `release-images` list includes `envoy-dataplane`, which the Envoy router and
+egress run. Without `--insecure-ignore-tlog`, `cosign verify` reports every
+image unsigned, because the signatures were made with `--tlog-upload=false`.
+
 ## 3. Create the rustfs credential Secret
 
 ```bash
-kubectl create namespace ate-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f manifests/ate-install/cygnus/namespace.yaml    # privileged PSS: atelet hostPaths, gVisor workers
 umask 077; f=$(mktemp)
-op read 'op://cloud/ate-objectstore-rustfs-cygnus/password' > "$f"
+op read 'op://cloud/ate-objectstore-rustfs-cygnus/password' | tr -d '\n' > "$f"   # op read appends a newline; --from-file keeps it
 kubectl -n ate-system create secret generic ate-objectstore-s3 \
   --from-literal=AWS_ACCESS_KEY_ID=ate-objectstore \
   --from-file=AWS_SECRET_ACCESS_KEY="$f"
@@ -100,7 +127,15 @@ shred -u "$f"
 kubectl -n ate-system get secret ate-objectstore-s3 -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d | wc -c   # 40
 ```
 
-`harbor-pull` must exist in the namespace too; the paas lane owns it.
+`harbor-pull` must exist in the namespace too; the paas lane owns it. Nothing
+recreates it after a namespace deletion: save it before a reinstall
+(`kubectl -n ate-system get secret harbor-pull -o json`, strip `uid`,
+`resourceVersion` and `creationTimestamp`) into a mode-0600 file, apply it back,
+shred the file.
+
+The namespace is `restricted:latest` in PodSecurity warn mode: rustfs, the
+bucket Job and several control plane pods print a "would violate" warning on
+apply. They are admitted; the warning is a to-do for the manifests.
 
 ## 4. Deploy rustfs
 
@@ -134,14 +169,46 @@ kubectl -n ate-system get workerpool default-workers -w   # READY 4
 
 ```bash
 kubectl -n ate-system get pods                       # every pod Running, 0 restarts
-kubectl ate get actors -A                            # empty on a fresh install
-go run ./cmd/ate-setup --kubeconfig ~/.kube/cygnus deploy demo demo-counter --config docs/examples/cygnus-install.yaml
+kubectl ate get workers                              # 4 WORKER_STATE_ACTIVE in default-workers
 ```
 
-A pass is one counter actor reaching RUNNING, surviving a suspend and a resume,
-and answering its request. The demo's own README has the request.
+The counter demo, by hand rather than through `ate-setup deploy demo counter`:
+that path resolves `ko://` images by building them, and its template hard-codes
+a `gs://` storage location. The template below uses the pre-built `counter`
+image and the cluster-wide `s3://` location:
+
+```bash
+kubectl ate create atespace ate-demo-counter
+kubectl ate create actor-template -f docs/examples/cygnus-counter-template.yaml
+kubectl ate get actor-template counter -a ate-demo-counter   # wait for GOLDEN TAG
+kubectl ate create actor my-counter-1 -a ate-demo-counter --template counter
+kubectl apply -f docs/examples/cygnus-ingress-check.yaml
+kubectl -n ate-system wait --for=condition=Ready pod/ate-ingress-client
+post() { kubectl -n ate-system exec ate-ingress-client -- curl -s -X POST \
+  --cert /run/podidentity/credential-bundle.pem --key /run/podidentity/credential-bundle.pem \
+  --cacert /run/servicedns-ca/trust-bundle.pem \
+  -H "ate-target-actor: ate-demo-counter/my-counter-1" https://atenet-router.ate-system.svc/; echo; }
+post; post                                            # count 1, then 2; actor RUNNING
+kubectl ate suspend actor my-counter-1 -a ate-demo-counter
+post                                                  # count 3: memory survived the suspend
+kubectl -n ate-system delete pod ate-ingress-client
+```
+
+A pass is HTTP 200 with `preserved memory count` continuing across the suspend,
+and the same request without `--cert` failing in the TLS handshake. Run on
+2026-10-28: counts 1, 2, 3; no-certificate request refused (curl exit 55).
 
 ## Reinstall and rollback
+
+A node keeps `/var/lib/ate` across a reinstall, and v0.6.0 refuses the image
+cache layout that releases before it wrote (`image cache at
+"/var/lib/ate/image-cache" has layout version "1" and this atelet supports "2"`;
+atelet crash-loops). With no actor on any node, remove the directory on every
+node that ran atelet. Talos has no shell, so use a one-shot privileged
+DaemonSet with `hostPath: /var/lib/ate` that runs
+`rm -rf /host/var/lib/ate/image-cache`, and delete it once every pod logs done.
+Delete nothing else under `/var/lib/ate`.
+
 
 Before 1.0 a minor jump is a reinstall ([upgrade.md](upgrade.md)). From the old
 checkout: `go run ./cmd/ate-setup delete ate-system`, which removes the
@@ -157,6 +224,18 @@ kubectl get sandboxconfig -o yaml >> before.yaml
 Rollback is re-applying that snapshot; the old images stay in Harbor by digest.
 
 ## Known limits (2026-10-28)
+
+- The agentgateway dataplane does not work at v0.6.0 (see "Dataplane").
+- The `counter` demo image is published but not signed: atelet pulls actor
+  images inside the sandbox, so Kyverno never sees them. Sign actor images
+  anyway once the install leaves reference status.
+- atelet and the workers log `OpenTelemetry SDK error ... unknown service
+  opentelemetry.proto.collector.metrics.v1.MetricsService`: the Alloy gateway
+  takes OTLP traces but not OTLP metrics on that port.
+- Right after `create actor`, a request through the router can get 404 `Actor
+  not found` for a few seconds; it resolved on its own in the 2026-10-28 run.
+- A reinstall over an older release must clear `/var/lib/ate/image-cache` on
+  every node first (see "Reinstall and rollback").
 
 - `postgres` and `rustfs` pull from Docker Hub, and Kyverno `restrict-image-registries`
   logs them (Audit). Mirror them when the install leaves reference status.
