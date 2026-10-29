@@ -1,0 +1,54 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Cygnus, agentgateway dataplane only (atenet.dataplane: agentgateway). List it
+# in manifests.components after components/cygnus. Under the Envoy dataplane
+# (the v0.6.0 default and what the reference install runs) this component must
+# stay out: its container patch would add an imageless agentgateway container
+# to atenet-router and atenet-egress.
+#
+# Not used by the reference install since 2026-10-28: the agentgateway build
+# v0.6.0 pins (v0.0.0-alpha.168b05d6) decodes Actor.status at proto field 7
+# while the v0.6.0 ate-api-server sends it at field 5, so every proxied request
+# fails with "ResumeActor response did not include a worker assignment".
+# Upstream re-paired them after v0.6.0 (agentgateway v1.7.0, #2962).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# The agentgateway image comes from the estate's Harbor mirror, pinned to the
+# same digest upstream pins.
+images:
+  - name: cr.agentgateway.dev/agentgateway
+    newName: harbor.unsigned.gg/platform/agentgateway
+    digest: sha256:5e8384d1fcfdc443a3ad5155ea6a64dc7953bde162df7f5f8e131a5c19ae08a3
+
+patches:
+  # agentgateway reads its OTLP target from its own variable, not from
+  # ate-otel-config.
+  - target:
+      kind: Deployment
+      name: atenet-router|atenet-egress
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: overridden-by-target
+      spec:
+        template:
+          spec:
+            containers:
+            - name: agentgateway
+              env:
+              - name: AGENTGATEWAY_OTLP_ADDRESS
+                value: alloy-gateway.monitoring.svc.cluster.local:4317

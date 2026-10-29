@@ -15,20 +15,14 @@
 # Cygnus: the unsigned-gg Talos bare-metal cluster. Composed into every control
 # plane apply through `manifests.components` (see docs/cygnus-install.md), so
 # the same patches reach a workload whichever ate-setup step delivers it.
+# Dataplane-neutral: what only the agentgateway dataplane needs is in the
+# sibling component cygnus-agentgateway.
 #
 # Every patch names its targets with a selector. kustomize skips a selector
 # that matches nothing, which is what lets one component serve the full
 # bundle and the single-component redeploys alike.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
-
-# The agentgateway image comes from the estate's Harbor mirror, pinned to the
-# same digest upstream pins. The ko:// component images are resolved by
-# ate-setup from images.repo and images.tag, not here.
-images:
-  - name: cr.agentgateway.dev/agentgateway
-    newName: harbor.unsigned.gg/platform/agentgateway
-    digest: sha256:5e8384d1fcfdc443a3ad5155ea6a64dc7953bde162df7f5f8e131a5c19ae08a3
 
 patches:
   # Harbor is a private registry: every workload pulls with the harbor-pull
@@ -155,26 +149,9 @@ patches:
             - name: image-credential-provider-config
               $patch: delete
 
-  # Telemetry goes to the estate's Grafana Alloy gateway. ate-otel-config is
-  # set through the otlpEndpoint install setting; agentgateway reads its own
-  # variable.
-  - target:
-      kind: Deployment
-      name: atenet-router|atenet-egress
-    patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: overridden-by-target
-      spec:
-        template:
-          spec:
-            containers:
-            - name: agentgateway
-              env:
-              - name: AGENTGATEWAY_OTLP_ADDRESS
-                value: alloy-gateway.monitoring.svc.cluster.local:4317
-
+  # Telemetry goes to the estate's Grafana Alloy gateway through the
+  # otlpEndpoint install setting. The ko:// component images are resolved by
+  # ate-setup from images.repo and images.tag, not here.
   - target:
       kind: ConfigMap
       name: ate-otel-config
